@@ -47,12 +47,16 @@ class PlannerViewModel(app: Application) : AndroidViewModel(app) {
     var date by mutableStateOf(today)
     var brush by mutableStateOf<Brush>(Brush.None)
     var quickOpen by mutableStateOf(false)
+    /** Whether the Today page's "Week focus" section is expanded. */
+    var focusOpen by mutableStateOf(false)
     var hidePast by mutableStateOf(false)
     var quickGoal by mutableStateOf<Long?>(null)
     /** Text waiting for the import dialog (from the share sheet), or "" to open it empty. */
     var importText by mutableStateOf<String?>(null)
     var importTarget by mutableStateOf<Long?>(null)
     var undoEvent by mutableStateOf<UndoEvent?>(null)
+    /** The Google Drive window (kept here so it survives the sign-in screen). */
+    var driveOpen by mutableStateOf(false)
 
     private var saveJob: Job? = null
 

@@ -125,6 +125,34 @@ pub fn slot_time(slot: u8) -> String {
     format!("{:02}:{:02}", slot / 2, if slot % 2 == 1 { 30 } else { 0 })
 }
 
+/// Sleep hours as half-hour slots, `start` up to (not including) `end`,
+/// wrapping past midnight (22:00–06:00 is start 44, end 12). Shared by both apps.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Sleep {
+    pub start: u8,
+    pub end: u8,
+}
+
+impl Default for Sleep {
+    fn default() -> Self {
+        Sleep { start: 44, end: 12 }
+    }
+}
+
+impl Sleep {
+    pub fn contains(&self, slot: u8) -> bool {
+        if self.start <= self.end {
+            (self.start..self.end).contains(&slot)
+        } else {
+            slot >= self.start || slot < self.end
+        }
+    }
+
+    pub fn label(&self) -> String {
+        format!("{}–{}", slot_time(self.start), slot_time(self.end % SLOTS))
+    }
+}
+
 /// Sort key for a goal priority: P1 first, "none" last.
 pub fn priority_rank(p: u8) -> u8 {
     if p == 0 { 5 } else { p }
@@ -137,6 +165,9 @@ pub struct Store {
     /// Day plans: date → half-hour slot (0..48) → row id doing it.
     #[serde(default)]
     pub schedule: BTreeMap<NaiveDate, BTreeMap<u8, u64>>,
+    /// Sleep hours, shaded on the day-plan clock.
+    #[serde(default)]
+    pub sleep: Sleep,
 }
 
 impl Store {
@@ -392,6 +423,20 @@ mod tests {
 
     fn d(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
+    }
+
+    #[test]
+    fn sleep_wraps_past_midnight() {
+        let night = Sleep::default();
+        assert!(night.contains(44) && night.contains(47) && night.contains(0) && night.contains(11));
+        assert!(!night.contains(12) && !night.contains(43));
+        assert_eq!(night.label(), "22:00–06:00");
+        let nap = Sleep { start: 26, end: 28 };
+        assert!(nap.contains(26) && nap.contains(27) && !nap.contains(28));
+        assert!(!Sleep { start: 10, end: 10 }.contains(10), "equal start/end = no sleep");
+        // Older files without the field get the default.
+        let s: Store = serde_json::from_str(r#"{"goals":[],"next_id":0}"#).unwrap();
+        assert_eq!(s.sleep, Sleep::default());
     }
 
     #[test]

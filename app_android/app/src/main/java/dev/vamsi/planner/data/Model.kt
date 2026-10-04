@@ -74,6 +74,18 @@ const val SLOTS = 48
 
 fun slotTime(slot: Int) = "%02d:%02d".format(slot / 2, if (slot % 2 == 1) 30 else 0)
 
+/**
+ * Sleep hours as half-hour slots, [start] up to (not including) [end], wrapping
+ * past midnight (22:00–06:00 is 44..12). Stored in the data file, shared with desktop.
+ */
+@Serializable
+data class Sleep(val start: Int = 44, val end: Int = 12) {
+    operator fun contains(slot: Int) =
+        if (start <= end) slot in start until end else slot >= start || slot < end
+
+    val label get() = "${slotTime(start)}–${slotTime(end % SLOTS)}"
+}
+
 /** Sort key for a goal priority: P1 first, "none" last. */
 fun priorityRank(p: Int) = if (p == 0) 5 else p
 
@@ -85,6 +97,8 @@ data class Store(
     @SerialName("next_id") val nextId: Long = 0,
     /** date (YYYY-MM-DD) → half-hour slot (0..47) → row id. */
     val schedule: Map<String, Map<Int, Long>> = emptyMap(),
+    /** Sleep hours, shaded on the day-plan clock. */
+    val sleep: Sleep = Sleep(),
 ) {
     fun goal(id: Long) = goals.firstOrNull { it.id == id }
 

@@ -43,7 +43,7 @@ src/
 ├── dayplan.rs  Today's "Day plan": 24 h clock of half-hour slots, task chips, schedule list
 ├── goal.rs     Goal page: icon, title, priority, Done·Date·Task·Notes table, add/delete rows
 ├── layout.rs   Custom layout managers: resizable table columns, two-column Today split
-├── cloud.rs    Google token from GNOME Online Accounts (D-Bus) + Drive v3 calls; blocking
+├── cloud.rs    Google OAuth (loopback + PKCE, client from build.rs) + Drive v3 calls; blocking
 ├── sync.rs     Drive sync on the GTK side: status icon, sign-in window, pull/push, conflicts
 ├── import.rs   Pasted table → plan rows: Markdown/TSV/HTML readers, date parser, column roles (no GUI, unit-tested)
 ├── import_dialog.rs  "Import a plan" dialog: clipboard, live preview, import with undo
@@ -178,12 +178,14 @@ adw::ApplicationWindow
 
 ### Day plan (`dayplan.rs`)
 
-- **Items:** everything schedulable that day (carried-over todos, focuses,
-  todos) in priority order, each given a palette colour by position. The
+- **Items:** everything schedulable that day (carried-over todos and the
+  day's todos; week focuses are context, not tasks, so they're excluded) in
+  priority order, each given a palette colour by position. The
   same colour is used on the clock, chips and pills.
 - **Clock:** a `gtk::DrawingArea` drawn with cairo. It's a ring of 48
-  half-hour slots with midnight at the top, running clockwise. Night hours
-  are dimmer. It has hour ticks with labels every 3 h, a red "now" hand
+  half-hour slots with midnight at the top, running clockwise. Sleep hours
+  (`Store::sleep`, a `Sleep { start, end }` slot range that wraps past
+  midnight, default 22:00–06:00, set via the 🌙 button) are shaded darker. It has hour ticks with labels every 3 h, a red "now" hand
   (redrawn every minute, today only), and a centre read-out: the hovered
   slot's time and task, or the day's total.
 - **Painting:** a `GestureDrag` on the clock.
@@ -322,7 +324,7 @@ An Undo toast either removes the new goal or restores the old rows.
 ## Tests
 
 `cargo test` runs the cloud tests (query escaping, old settings files still
-load, changing folder, and reading Online Accounts without side effects), the
+load, changing folder, PKCE, loopback rejects a forged `state`, cancelling sign-in), the
 model tests (priority ordering; slots → blocks, ignoring
 deleted rows; unscheduling) and the parser tests in `import.rs`: date formats, your real
 Notion Markdown (12 week ranges + 7 days, multi-line cells, notes), TSV
@@ -331,41 +333,42 @@ reporting rows without dates, and headerless tables.
 
 ## Google Drive sync (`cloud.rs`, `sync.rs`)
 
-The local file stays the working copy, and Drive holds the shared copy.
+The local file stays the working copy, and Drive holds the shared copy:
+`My Drive/<folder>/planner-data.json` (default folder "Planner"). The Android
+app uses the same file and the same rules (`app_android/…/DriveSync.kt`).
 
-**No sign-in of our own.** Google requires every API caller to be a
-registered OAuth client. Instead of shipping one (or asking users to create
-one), Planner borrows the Google account from Ubuntu Settings → Online
-Accounts. GNOME Online Accounts ("GOA") is GNOME's registered client, and it
-gives local apps access tokens over D-Bus:
-- `cloud::google_accounts()` calls `GetManagedObjects` on
-  `org.gnome.OnlineAccounts` and keeps accounts whose `ProviderType` is
-  `google` and that implement `OAuth2Based`. It reads `Id`, `Identity`
-  (email) and `AttentionNeeded`.
-- Each Drive request gets a fresh token from `OAuth2Based.GetAccessToken`
-  (GOA caches and refreshes it). A `NotAuthorized` error means GNOME needs
-  you to sign in again; the window then shows "Open Online Accounts…",
-  which runs `gnome-control-center online-accounts`.
+**One Google Cloud project, scope `drive.file`.** Planner sees only files its
+own project created. Google applies that per project, so the desktop client
+and the Android clients in the same project share the file.
 
-**Folder confinement:** GOA's token covers the whole Drive, so the
-"one folder" rule is enforced by Planner's own code:
-- The folder is found by name at the top of My Drive, or created there.
-- The data file is looked up only *inside* that folder by name, and a stored
-  `file_id` is only trusted if its `parents` include that folder.
-- Planner never lists or modifies anything else.
-- Query values are escaped (`quoted`) so a folder name can't break the query.
+**Desktop sign-in** (`cloud::begin_auth` / `PendingAuth::finish`): the OAuth
+2.0 flow for installed apps.
+1. Bind `127.0.0.1:0` and open Google's consent page in the browser
+   (`gtk::UriLauncher`) with a PKCE S256 challenge and a random `state`.
+2. A worker thread waits for the redirect: up to 5 min, or until Cancel. It
+   checks `state`, answers the browser with a small page, and exchanges the
+   code for tokens.
+3. The OAuth client comes from `build.rs`: `google-client.json` (git-ignored)
+   or the `PLANNER_GOOGLE_CLIENT_ID/SECRET` env vars, compiled in via
+   `option_env!`. Builds without one ask for it in the sign-in window.
+4. The refresh token and sync bookkeeping are kept in
+   `~/.config/planner/google-drive.json` (mode 0600). Access tokens are cached
+   in memory only.
 
-**Settings file:** `~/.config/planner/google-drive.json` holds the GOA
-account id and email, the folder name, the Drive `file_id`, the file
-`version` last seen, a `dirty` flag (local changes not uploaded yet) and
-`last_sync`. It contains no tokens or secrets.
+**Android sign-in:** Google Play services' Authorization API. The app is
+identified by package name + signing-certificate SHA-1, so no secret ships in
+the APK. Once access is granted, `authorize()` returns fresh tokens silently.
+The consent screen's result handler is registered at the app level, so it
+survives screen recreation. Failures are always surfaced, and for an
+unregistered build the message gives the exact package and SHA-1 to register.
 
-**Drive layout:** `My Drive/<folder>/planner-data.json`, the same JSON as the
-local file. The first upload creates the folder and file (metadata first, then
-`PATCH …?uploadType=media`). Later uploads overwrite the content in place.
-Changing the folder clears `file_id`/`version`, so the next sync finds or
-creates the file there; if the new folder already has data, Planner asks
-which copy to keep.
+**Folder confinement:** every lookup is scoped to the chosen top-level
+folder. A stored `file_id` is trusted only if its `parents` include that
+folder, and query values are escaped.
+
+**Conflicts compare data, not text:** the two apps format JSON differently, so
+`same_data` (desktop) and `Store` equality (Android) decide whether the copies
+really differ.
 
 **Threading:** `cloud.rs` is blocking (`ureq` with rustls, 30 s timeout).
 `sync.rs` runs it with `gio::spawn_blocking` inside
@@ -377,25 +380,26 @@ runs at a time (`busy`), and changes made meanwhile set `again`.
 | Trigger | What happens |
 |---|---|
 | Local save (`Ui::save_soon` → `sync::local_saved`) | mark `dirty`, upload 2 s later (debounced) |
-| Startup, after sign-in, "Sync now" (`sync_now`) | no Drive file → upload. Drive unchanged → upload if `dirty`. Drive changed → download, unless we're `dirty` or this is a first sign-in with local data, then ask |
-| Before every upload | if Drive's `version` moved since we last saw it → ask instead of overwriting |
+| Startup, after sign-in, "Sync now" (`sync_now`) | no Drive file → upload. Drive unchanged → upload if `dirty`. Drive changed → download, unless we're `dirty` or this is a first sign-in with local data: then local wins (see below) |
+| Before every upload | if Drive's `version` moved since we last saw it → local wins (see below) |
 | Window close with `dirty` | hide the window, finish the upload, then destroy it (`hold_close`) |
 
-**Conflicts** (`ask_conflict`): "Use Google Drive's" / "Keep this
-computer's" / "Decide later". The copy that isn't kept is written next to the
-data file (`data.before-drive.json` or `data.drive-backup.json`), so nothing
-is lost.
+**Conflicts — this device wins, no prompt** (`keep_local` on desktop,
+`keepLocal` on Android): when both sides changed, Drive's copy is saved next
+to the local data file as `data.drive-backup.json`, then the local data is
+uploaded over it (`upload(force)`). When only Drive changed, its copy is
+downloaded, and the replaced local file is kept as `data.before-drive.json`.
+So nothing is lost either way.
 
-**Status icon** (`sync::status_button`, in each goal page's header): a
+**Status icon** (`sync::status_button`, in the Today page's header): a
 cairo-drawn database cylinder with a badge. Red ✕ = signed out, green ✓ =
 synced, blue arc = syncing, orange ! = error (the tooltip says what). All
 icons repaint on status changes, and the open sign-in window rebuilds
 itself.
 
-**Errors:** if the account disappears from Settings, Planner disconnects and
-shows a toast. Anything else, including "sign in again in Settings" and a
-token that lacks Drive access, shows the orange ! badge with the message,
-leaves the connection in place, and retries on the next save or "Sync now".
+**Errors:** a revoked or expired sign-in (`invalid_grant` / 401) signs out
+with a toast. Anything else shows the orange ! badge with the message, stays
+signed in, and retries on the next save or "Sync now".
 
 ## Install / desktop integration
 

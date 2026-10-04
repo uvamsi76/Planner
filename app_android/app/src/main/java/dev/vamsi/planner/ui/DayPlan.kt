@@ -15,6 +15,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FilterChip
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.Box
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
@@ -78,6 +86,7 @@ fun DayPlanPanel(vm: PlannerViewModel, date: LocalDate, items: List<PlanItem>, m
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         DayClock(vm, date, items, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 380.dp).fillMaxWidth())
+        SleepControl(vm, Modifier.align(Alignment.CenterHorizontally))
 
         val brush = vm.brush
         Text(
@@ -138,6 +147,45 @@ fun DayPlanPanel(vm: PlannerViewModel, date: LocalDate, items: List<PlanItem>, m
     }
 }
 
+/** "🌙 Sleep 22:00–06:00": pick bedtime and wake-up; shared with desktop via the data file. */
+@Composable
+private fun SleepControl(vm: PlannerViewModel, modifier: Modifier = Modifier) {
+    var open by remember { mutableStateOf(false) }
+    val sleep = vm.store.sleep
+    TextButton(onClick = { open = true }, modifier = modifier) {
+        Ic(R.drawable.ic_moon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("  Sleep ${sleep.label}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+    if (!open) return
+    AlertDialog(
+        onDismissRequest = { open = false },
+        icon = { Ic(R.drawable.ic_moon, null) },
+        title = { Text("Sleep hours") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                TimeChoice("Bedtime", sleep.start) { v -> vm.update { it.copy(sleep = it.sleep.copy(start = v)) } }
+                TimeChoice("Wake up", sleep.end % SLOTS) { v -> vm.update { it.copy(sleep = it.sleep.copy(end = v)) } }
+                Text("Shaded darker on the clock.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        confirmButton = { TextButton(onClick = { open = false }) { Text("Done") } },
+    )
+}
+
+@Composable
+private fun TimeChoice(label: String, slot: Int, onPick: (Int) -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        Box {
+            OutlinedButton(onClick = { menu = true }) { Text(slotTime(slot)) }
+            DropdownMenu(menu, { menu = false }, Modifier.heightIn(max = 320.dp)) {
+                for (s in 0 until SLOTS) DropdownMenuItem(text = { Text(slotTime(s)) }, onClick = { onPick(s); menu = false })
+            }
+        }
+    }
+}
+
 @Composable
 private fun ScheduleRow(vm: PlannerViewModel, date: LocalDate, b: Block, items: List<PlanItem>) {
     val item = items.firstOrNull { it.rid == b.row }
@@ -160,6 +208,7 @@ private fun ScheduleRow(vm: PlannerViewModel, date: LocalDate, b: Block, items: 
 @Composable
 fun DayClock(vm: PlannerViewModel, date: LocalDate, items: List<PlanItem>, modifier: Modifier = Modifier) {
     val slots = vm.store.slots(date)
+    val sleep = vm.store.sleep
     val colors = items.associate { it.rid to it.color }
     val titles = items.associate { it.rid to it.title }
     val isToday = date == vm.today
@@ -242,10 +291,10 @@ fun DayClock(vm: PlannerViewModel, date: LocalDate, items: List<PlanItem>, modif
         val slotDeg = 360f / SLOTS
         for (s in 0 until SLOTS) {
             val rid = slots[s]
-            val night = s !in 12 until 44 // before 06:00 and after 22:00
+            val night = s in sleep
             val color = when {
                 rid != null -> (colors[rid] ?: Color.Gray).copy(alpha = if (active == s) 1f else 0.9f)
-                else -> fg.copy(alpha = (if (night) 0.05f else 0.09f) + if (active == s) 0.12f else 0f)
+                else -> fg.copy(alpha = (if (night) 0.025f else 0.09f) + if (active == s) 0.12f else 0f)
             }
             drawArc(
                 color = color,
@@ -289,7 +338,7 @@ fun DayClock(vm: PlannerViewModel, date: LocalDate, items: List<PlanItem>, modif
         }
         // Centre: the slot under your finger, else the day's total.
         val (big, small) = active?.let { s ->
-            "${slotTime(s)}–${slotTime(s + 1)}" to (slots[s]?.let { titles[it] ?: "" }?.take(22) ?: "Free")
+            "${slotTime(s)}–${slotTime(s + 1)}" to (slots[s]?.let { titles[it] ?: "" }?.take(22) ?: if (s in sleep) "Sleep" else "Free")
         } ?: (duration(slots.size) to "planned")
         val bigText = measurer.measure(big, TextStyle(fontSize = 20.sp, fontWeight = FontWeight.Bold, color = fg.copy(alpha = 0.9f)))
         val smallText = measurer.measure(small, TextStyle(fontSize = 12.sp, color = fg.copy(alpha = 0.6f)))

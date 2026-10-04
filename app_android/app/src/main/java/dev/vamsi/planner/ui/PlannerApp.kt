@@ -1,6 +1,8 @@
 package dev.vamsi.planner.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -39,6 +41,11 @@ fun PlannerApp(vm: PlannerViewModel) {
     val snackbar = remember { SnackbarHostState() }
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    // Google's sign-in screen reports back here: registered at the app level so the
+    // result still arrives if Android recreates the screen while it's open.
+    val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
+        vm.drive.onConsentResult(it.resultCode, it.data)
+    }
 
     LaunchedEffect(vm.undoEvent) {
         val ev = vm.undoEvent ?: return@LaunchedEffect
@@ -82,7 +89,7 @@ fun PlannerApp(vm: PlannerViewModel) {
     }
 
     if (vm.importText != null) ImportDialog(vm)
-    ConflictDialog(vm)
+    if (vm.driveOpen) DriveDialog(vm, launch = { consent.launch(it) }, onDismiss = { vm.driveOpen = false })
 }
 
 /** Today, then goals by priority with P-badges and today's remaining counts. */

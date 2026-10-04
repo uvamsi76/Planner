@@ -54,6 +54,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.ui.unit.dp
 import dev.vamsi.planner.R
@@ -81,12 +82,13 @@ fun TodayScreen(vm: PlannerViewModel, snackbar: SnackbarHostState, onMenu: (() -
                 actions = {
                     IconButton(onClick = { vm.date = vm.date.minusDays(1) }) { Ic(R.drawable.ic_prev, "Previous day") }
                     IconButton(onClick = { vm.date = vm.date.plusDays(1) }) { Ic(R.drawable.ic_next, "Next day") }
-                    if (vm.date != vm.today) TextButton(onClick = { vm.date = vm.today }) { Text("Today") }
                     // Small "+" that reveals the add-a-todo bar (hidden by default).
                     IconToggleButton(checked = vm.quickOpen, onCheckedChange = { vm.quickOpen = it }) {
                         Ic(R.drawable.ic_add, "Add a todo for this day")
                     }
                     IconButton(onClick = { picking = true }) { Ic(R.drawable.ic_calendar, "Pick a date") }
+                    // Google Drive: database icon with ✕ (signed out) or ✓ (synced).
+                    DriveButton(vm)
                 },
             )
         },
@@ -99,7 +101,10 @@ fun TodayScreen(vm: PlannerViewModel, snackbar: SnackbarHostState, onMenu: (() -
             if (maxWidth >= 720.dp) {
                 // Tablet / landscape: todos left, day plan right (like the desktop).
                 Row(Modifier.fillMaxSize()) {
-                    LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(24.dp)) { todos(vm, items, blocks) }
+                    LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(24.dp)) {
+                        todos(vm, items, blocks)
+                        focusSection(vm)
+                    }
                     DayPlanPanel(
                         vm, date, items,
                         Modifier.width(360.dp).verticalScroll(rememberScrollState()).padding(top = 24.dp, end = 24.dp, bottom = 24.dp),
@@ -112,8 +117,9 @@ fun TodayScreen(vm: PlannerViewModel, snackbar: SnackbarHostState, onMenu: (() -
                     item(key = "dayplan") {
                         Spacer(Modifier.height(28.dp))
                         DayPlanPanel(vm, date, items)
-                        Spacer(Modifier.height(24.dp))
                     }
+                    focusSection(vm)
+                    item(key = "bottom") { Spacer(Modifier.height(24.dp)) }
                 }
             }
         }
@@ -128,7 +134,8 @@ private fun planItems(vm: PlannerViewModel): List<PlanItem> {
     val s = vm.store
     val rows = mutableListOf<Pair<Goal, PlanRow>>()
     if (vm.date == vm.today) rows += s.overdue(vm.date)
-    for (g in s.agenda(vm.date)) rows += (g.ranges + g.days).map { g.goal to it }
+    // Ranges (week focuses) aren't tasks: no chip, no time on the clock.
+    for (g in s.agenda(vm.date)) rows += g.days.map { g.goal to it }
     return rows.mapIndexed { i, (g, r) ->
         PlanItem(r.id, firstLine(r.task).ifEmpty { "Untitled" }, "${g.icon} ${displayName(g.name)}", Palette[i % Palette.size])
     }
@@ -144,17 +151,21 @@ private fun LazyListScope.todos(vm: PlannerViewModel, items: List<PlanItem>, blo
 
     item(key = "header") {
         val days = ChronoUnit.DAYS.between(today, date)
-        Text(
-            when {
-                days == 0L -> "Today"
-                days == 1L -> "Tomorrow"
-                days == -1L -> "Yesterday"
-                days > 0 -> "In $days days"
-                else -> "${-days} days ago"
-            },
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontWeight = FontWeight.SemiBold,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                when {
+                    days == 0L -> "Today"
+                    days == 1L -> "Tomorrow"
+                    days == -1L -> "Yesterday"
+                    days > 0 -> "In $days days"
+                    else -> "${-days} days ago"
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold,
+            )
+            // Jump back (lives here, not in the top bar, to leave room on phones).
+            if (days != 0L) TextButton(onClick = { vm.date = today }) { Text("Back to today") }
+        }
         Text(date.format(titleFmt), style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(bottom = 8.dp))
         val (done, total) = store.progress(date)
         if (total > 0) {
@@ -190,8 +201,9 @@ private fun LazyListScope.todos(vm: PlannerViewModel, items: List<PlanItem>, blo
         }
     }
 
+    // Only checkbox todos here; week focuses go in a collapsed section at the end.
     val agenda = store.agenda(date)
-    for (group in agenda) {
+    for (group in agenda.filter { it.days.isNotEmpty() }) {
         val g = group.goal
         item(key = "g${g.id}") {
             Row(
@@ -207,37 +219,61 @@ private fun LazyListScope.todos(vm: PlannerViewModel, items: List<PlanItem>, blo
                 PriorityBadge(g.priority)
             }
         }
-        for (r in group.ranges) item(key = "r${r.id}") {
-            Surface(
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.055f),
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-            ) {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("📌")
-                        Text(r.task.ifEmpty { "Untitled focus" }, Modifier.weight(1f), fontWeight = FontWeight.Bold)
-                        Text(fmtRange(r.start, r.end), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    val t = timeText(r.id, blocks)
-                    if (t.isNotEmpty()) color(r.id)?.let { TimePill(t, it) }
-                    if (r.notes.isNotBlank()) Text(r.notes, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                }
-            }
-        }
         for (r in group.days) item(key = "d${r.id}") {
             TodoRow(vm, g, r, notes = r.notes, time = timeText(r.id, blocks), color = color(r.id))
         }
     }
 
-    if (agenda.isEmpty() && overdue.isEmpty()) {
+    if (overdue.isEmpty() && agenda.all { it.days.isEmpty() }) {
         item(key = "empty") {
             Column(Modifier.padding(top = 32.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Nothing planned for this day.", style = MaterialTheme.typography.titleMedium)
+                Text("No todos for this day.", style = MaterialTheme.typography.titleMedium)
                 Text(
                     "Add rows to a goal’s plan, share a Notion table to Planner, or tap + above to jot something down.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Week focuses (and other ranges) covering the day, collapsed by default:
+ * they're context, not tasks, so they stay out of the way at the end.
+ */
+private fun LazyListScope.focusSection(vm: PlannerViewModel) {
+    val focuses = vm.store.agenda(vm.date).flatMap { g -> g.ranges.map { g.goal to it } }
+    if (focuses.isEmpty()) return
+    item(key = "focus-head") {
+        Row(
+            Modifier
+                .padding(top = 24.dp, bottom = 4.dp)
+                .clickable { vm.focusOpen = !vm.focusOpen }
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("📌")
+            Text("Week focus · ${focuses.size}", style = MaterialTheme.typography.titleSmall)
+            Ic(
+                if (vm.focusOpen) R.drawable.ic_expand_less else R.drawable.ic_expand_more,
+                if (vm.focusOpen) "Hide" else "Show",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+    if (vm.focusOpen) for ((g, r) in focuses) item(key = "r${r.id}") {
+        Surface(
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.055f),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        ) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(r.task.ifEmpty { "Untitled focus" }, Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                    Text("${g.icon} · ${fmtRange(r.start, r.end)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (r.notes.isNotBlank()) Text(r.notes, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
             }
         }
     }
@@ -255,7 +291,11 @@ private fun TodoRow(vm: PlannerViewModel, g: Goal, r: PlanRow, notes: String, ti
                 textDecoration = if (r.done) TextDecoration.LineThrough else null,
                 color = if (r.done) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f) else MaterialTheme.colorScheme.onSurface,
             )
-            if (notes.isNotBlank()) Text(notes, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // Keep the page to the todos: long notes are cut to two lines.
+            if (notes.isNotBlank()) Text(
+                notes, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
         }
         if (time.isNotEmpty() && color != null) Box(Modifier.padding(top = 12.dp, start = 8.dp)) { TimePill(time, color) }
     }

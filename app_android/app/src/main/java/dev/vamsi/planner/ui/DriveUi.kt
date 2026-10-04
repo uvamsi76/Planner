@@ -1,7 +1,6 @@
 package dev.vamsi.planner.ui
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.IntentSenderRequest
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -9,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -35,8 +35,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import dev.vamsi.planner.data.FILE_NAME
 import java.text.DateFormat
-import java.time.OffsetDateTime
-import java.time.format.DateTimeFormatter
 import java.util.Date
 
 /** Database cylinder with a badge: ✕ signed out, ✓ synced, arc syncing, ! error. */
@@ -90,23 +88,18 @@ fun DriveIcon(status: SyncStatus, size: Dp = 24.dp) {
 
 @Composable
 fun DriveButton(vm: PlannerViewModel) {
-    var open by remember { mutableStateOf(false) }
-    IconButton(onClick = { open = true }) { DriveIcon(vm.drive.status) }
-    if (open) DriveDialog(vm) { open = false }
+    IconButton(onClick = { vm.driveOpen = true }) { DriveIcon(vm.drive.status) }
 }
 
 private fun lastSyncText(millis: Long?): String =
     millis?.let { "Last synced " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(it)) } ?: "Synced"
 
 @Composable
-fun DriveDialog(vm: PlannerViewModel, onDismiss: () -> Unit) {
+fun DriveDialog(vm: PlannerViewModel, launch: (IntentSenderRequest) -> Unit, onDismiss: () -> Unit) {
     val drive = vm.drive
     val acct = drive.account
     val status = drive.status
     var folder by remember(acct.folder) { mutableStateOf(acct.folder) }
-    val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
-        drive.onConsentResult(it.resultCode, it.data)
-    }
     val error = (status as? SyncStatus.Error)?.message
 
     AlertDialog(
@@ -157,13 +150,16 @@ fun DriveDialog(vm: PlannerViewModel, onDismiss: () -> Unit) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (error != null) Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    // Selectable, so the package name / SHA-1 can be copied into Google Cloud.
+                    if (error != null) SelectionContainer {
+                        Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                         if (drive.signingIn) {
                             CircularProgressIndicator(Modifier.size(20.dp).padding(end = 8.dp), strokeWidth = 2.dp)
                             Text("  Waiting for Google…")
                         } else {
-                            Button(onClick = { drive.signIn(folder) { consent.launch(it) } }, enabled = folder.isNotBlank()) {
+                            Button(onClick = { drive.signIn(folder, launch) }, enabled = folder.isNotBlank()) {
                                 Text("Sign in with Google")
                             }
                         }
@@ -172,32 +168,5 @@ fun DriveDialog(vm: PlannerViewModel, onDismiss: () -> Unit) {
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
-}
-
-/** "Which copy should Planner keep?" when both the phone and Drive changed. */
-@Composable
-fun ConflictDialog(vm: PlannerViewModel) {
-    val c = vm.drive.conflict ?: return
-    val goals = runCatching { dev.vamsi.planner.data.Store.fromJson(c.remote).goals.size }.getOrDefault(0)
-    val changed = c.meta.modified?.let {
-        runCatching { OffsetDateTime.parse(it).atZoneSameInstant(java.time.ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("EEE d MMM, HH:mm")) }.getOrNull()
-    } ?: "recently"
-    AlertDialog(
-        onDismissRequest = { vm.drive.resolveConflict(null) },
-        title = { Text("Which plans should Planner keep?") },
-        text = {
-            Text(
-                "Google Drive has a different copy (changed $changed, $goals goal${if (goals == 1) "" else "s"}) than this phone. " +
-                    "The copy you don't keep is saved as a backup file.",
-            )
-        },
-        confirmButton = { TextButton(onClick = { vm.drive.resolveConflict(true) }) { Text("Use Google Drive’s") } },
-        dismissButton = {
-            Row {
-                TextButton(onClick = { vm.drive.resolveConflict(null) }) { Text("Later") }
-                TextButton(onClick = { vm.drive.resolveConflict(false) }) { Text("Keep this phone’s") }
-            }
-        },
     )
 }

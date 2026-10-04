@@ -41,15 +41,19 @@ For development: `cargo run`.
     a daily todo; 7 days is a week focus.
   - **+ New day**, **+ Next 7 days** and **+ Week focus** add rows after the
     last one. Hover a row to delete it (with Undo).
-- **Today**: today's todos grouped by goal (by priority), 📌 week focuses,
-  and unfinished past todos under "Carried over". The **+** next to "Today"
-  opens a quick-add box (Esc hides it). ◀ ▶ or the calendar browse other
-  days.
+- **Today**: just the day's checkbox todos, grouped by goal (by priority),
+  plus unfinished past todos under "Carried over". Long notes are cut to two
+  lines. Week focuses (multi-day rows) are context, not tasks: they sit
+  collapsed under **📌 Week focus** at the end of the page. The **+** next to
+  "Today" opens a quick-add box (Esc hides it). ◀ ▶ or the calendar browse
+  other days.
 - **Day plan** (right side of Today): a 24-hour clock in half-hour slots.
   Click a task chip, then click or drag around the clock to give it time.
   Drag over its own slots to clear them, or use the Eraser. Tasks without
   time are listed first as unscheduled, by priority. Scheduled todos show
-  their time on the left.
+  their time on the left. **🌙 Sleep** under the clock sets your bedtime and
+  wake-up; those hours are shaded darker. The setting is stored in the data
+  file, so the phone app uses it too.
 - **Import from Notion**: select your plan table in Notion, press Ctrl+C,
   then press **Ctrl+V** anywhere in Planner. The import window shows what it
   understood: week ranges, daily rows, and anything it skipped. Pick a new
@@ -62,26 +66,39 @@ For development: `cargo run`.
 
 Data lives in `~/.local/share/planner/data.json` and saves automatically.
 
-## Google Drive sync
+## Google Drive sync (desktop + Android)
 
-Planner uses the Google account from **Ubuntu Settings → Online Accounts**,
-so there's no Google Cloud setup and no client ID.
+Both apps keep the same file, **My Drive › Planner › planner-data.json**. Click
+the **database icon** in the Today page's header: it shows ✕ when signed out,
+✓ when synced, and ! with the reason when something fails. Changes upload a
+couple of seconds after you make them. Each app loads the Drive copy when it
+starts. If both sides changed, this device's data wins and is uploaded, and
+Drive's previous copy is saved locally as `data.drive-backup.json`. Planner asks only
+for `drive.file`, so it can see only the files it creates.
 
-1. In Settings → Online Accounts, add your Google account (or sign in again
-   if it says it needs attention). Keep **Files** turned on.
-2. In Planner, open a goal page and click the **database icon** in the header
-   bar. It shows ✕ when not connected and ✓ when synced.
-3. Pick the account and a folder name in My Drive (default **Planner**),
-   then press **Use this account**.
+**One-time Google Cloud setup (done by you, the developer).** After this, users
+just tap *Sign in with Google*.
 
-Your data is then kept in **My Drive › <folder> › planner-data.json**, and
-the local file stays as an offline copy. Changes upload a couple of seconds
-after you make them. On startup Planner loads the Drive copy, and if both
-sides changed it asks which one to keep. You can change the folder or
-disconnect from the same window.
+1. <https://console.cloud.google.com/> → create a project → **APIs & Services →
+   Library** → enable **Google Drive API**.
+2. **Google Auth Platform → Branding**: app name, support email. **Audience**:
+   External, and add your account as a **test user**. **Data access**: add the
+   scope `.../auth/drive.file`.
+3. **Clients → Create client**, three times in the same project:
+   - **Desktop app**: download the JSON, save it as `google-client.json` in this
+     folder (git-ignored), then run `./install.sh`.
+   - **Android**, package `dev.vamsi.planner.debug`, SHA-1
+     `4E:36:DD:84:01:1A:4A:19:62:B8:E2:B7:CE:6A:84:DA:AB:BF:07:9A` (debug builds).
+   - **Android**, package `dev.vamsi.planner`, SHA-1
+     `8D:92:F8:72:7E:13:78:D8:45:07:5A:19:DD:69:99:58:73:57:82:AA` (your upload key).
+     Once the app is on Play, add another Android client with the **App signing
+     key** SHA-1 from Play Console → Setup → App signing.
+4. While the app is in *Testing*, only test users can sign in, and Google ends
+   desktop sign-ins after 7 days. Publish the app (Audience → Publish) to
+   lift that.
 
-GNOME's Google sign-in covers your whole Drive. Planner limits itself to the
-chosen folder: it only looks up and writes `planner-data.json` inside it.
+If Android sign-in fails, the Drive window shows Google's reason. For an
+unregistered build, it lists the exact package name and SHA-1 to register.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized.
 

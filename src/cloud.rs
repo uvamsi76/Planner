@@ -348,15 +348,13 @@ fn get(acct: &Account, url: &str) -> Result<String> {
 pub struct Meta {
     pub id: String,
     pub version: Option<String>,
-    #[serde(rename = "modifiedTime")]
-    pub modified: Option<String>,
     #[serde(default)]
     pub trashed: bool,
     #[serde(default)]
     pub parents: Vec<String>,
 }
 
-const META_FIELDS: &str = "id,version,modifiedTime,trashed,parents";
+const META_FIELDS: &str = "id,version,trashed,parents";
 
 fn search(acct: &Account, query: &str) -> Result<Vec<Meta>> {
     #[derive(Deserialize)]

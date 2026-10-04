@@ -42,6 +42,8 @@ pub fn page(ui: &Rc<Ui>) -> Page {
         .popover(&popover)
         .build();
     header.pack_end(&cal_btn);
+    // Google Drive status: database icon with ✕ (signed out) or ✓ (synced).
+    header.pack_end(&crate::sync::status_button(ui));
 
     let go = {
         let ui = ui.clone();
@@ -120,9 +122,10 @@ fn plan_items(ui: &Rc<Ui>, date: NaiveDate) -> (Vec<Item>, Vec<Block>) {
     if date == ui.today.get() {
         rows.extend(store.overdue(date).into_iter().map(|(gi, ri)| (store.goals[gi].rows[ri].id, &store.goals[gi])));
     }
-    for (gi, ranges, days) in store.agenda(date) {
+    // Ranges (week focuses) aren't tasks: no chip, no time on the clock.
+    for (gi, _, days) in store.agenda(date) {
         let g = &store.goals[gi];
-        rows.extend(ranges.iter().chain(&days).map(|&ri| (g.rows[ri].id, g)));
+        rows.extend(days.iter().map(|&ri| (g.rows[ri].id, g)));
     }
     let items = rows
         .into_iter()
@@ -138,6 +141,59 @@ fn plan_items(ui: &Rc<Ui>, date: NaiveDate) -> (Vec<Item>, Vec<Block>) {
         })
         .collect();
     (items, store.blocks(date))
+}
+
+/// Week focuses (and other ranges) covering the day, collapsed by default:
+/// they're context, not tasks, so they stay out of the way.
+fn focus_section(ui: &Rc<Ui>, focuses: &[(&crate::model::Goal, &crate::model::PlanRow)]) -> gtk::Box {
+    let section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["focus-section"]).build();
+    let open = ui.focus_open.get();
+    let arrow = gtk::Image::from_icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" });
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    head.append(&gtk::Label::new(Some("📌")));
+    head.append(&gtk::Label::builder().label(format!("Week focus · {}", focuses.len())).css_classes(["heading"]).build());
+    head.append(&arrow);
+    let toggle = gtk::Button::builder()
+        .child(&head)
+        .css_classes(["flat", "focus-toggle"])
+        .halign(gtk::Align::Start)
+        .tooltip_text(if open { "Hide" } else { "Show" })
+        .build();
+
+    let cards = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
+    for (g, r) in focuses {
+        let callout = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).css_classes(["callout"]).build();
+        let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let t = label(if r.task.is_empty() { "Untitled focus" } else { &r.task }, &["callout-title"]);
+        t.set_hexpand(true);
+        title.append(&t);
+        title.append(
+            &gtk::Label::builder()
+                .label(format!("{} · {}", g.icon, fmt_range(r.start, r.end)))
+                .valign(gtk::Align::Start)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        callout.append(&title);
+        if !r.notes.trim().is_empty() {
+            callout.append(&label(&r.notes, &["callout-notes"]));
+        }
+        cards.append(&callout);
+    }
+    let revealer = gtk::Revealer::builder().child(&cards).reveal_child(open).transition_type(gtk::RevealerTransitionType::SlideDown).build();
+    toggle.connect_clicked({
+        let (ui, revealer, toggle) = (ui.clone(), revealer.clone(), toggle.clone());
+        move |_| {
+            let open = !ui.focus_open.get();
+            ui.focus_open.set(open);
+            revealer.set_reveal_child(open);
+            arrow.set_icon_name(Some(if open { "pan-down-symbolic" } else { "pan-end-symbolic" }));
+            toggle.set_tooltip_text(Some(if open { "Hide" } else { "Show" }));
+        }
+    });
+    section.append(&toggle);
+    section.append(&revealer);
+    section
 }
 
 /// Coloured dot + "09:00–10:30" for a row with time on the clock, if any.
@@ -227,8 +283,9 @@ fn todos(ui: &Rc<Ui>, date: NaiveDate, items: &Rc<Vec<Item>>, blocks: &[Block]) 
         }
     }
 
+    // Only checkbox todos here; week focuses go in a collapsed section at the end.
     let agenda = store.agenda(date);
-    for (gi, ranges, days) in &agenda {
+    for (gi, _, days) in agenda.iter().filter(|(_, _, days)| !days.is_empty()) {
         let g = &store.goals[*gi];
         let heading = gtk::Button::builder().css_classes(["flat", "section-link"]).halign(gtk::Align::Start).build();
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -244,37 +301,6 @@ fn todos(ui: &Rc<Ui>, date: NaiveDate, items: &Rc<Vec<Item>>, blocks: &[Block]) 
             move |_| ui.show(View::Goal(gid))
         });
         page.append(&heading);
-
-        for &ri in ranges {
-            let r = &g.rows[ri];
-            let callout = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(4)
-                .css_classes(["callout"])
-                .build();
-            let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            let pin = label("📌", &[]);
-            pin.set_valign(gtk::Align::Start);
-            title.append(&pin);
-            let t = label(if r.task.is_empty() { "Untitled focus" } else { &r.task }, &["callout-title"]);
-            t.set_hexpand(true);
-            title.append(&t);
-            if let Some(p) = time_pill(r.id, items, blocks) {
-                title.append(&p);
-            }
-            title.append(
-                &gtk::Label::builder()
-                    .label(fmt_range(r.start, r.end))
-                    .valign(gtk::Align::Start)
-                    .css_classes(["dim-label", "caption"])
-                    .build(),
-            );
-            callout.append(&title);
-            if !r.notes.trim().is_empty() {
-                callout.append(&label(&r.notes, &["callout-notes"]));
-            }
-            page.append(&callout);
-        }
         for &ri in days {
             let r = &g.rows[ri];
             let row = todo_row(ui, g.id, r.id, &r.task, &r.notes, r.done(), date, update_progress.clone());
@@ -285,11 +311,21 @@ fn todos(ui: &Rc<Ui>, date: NaiveDate, items: &Rc<Vec<Item>>, blocks: &[Block]) 
         }
     }
 
-    if agenda.is_empty() && overdue.is_empty() {
+    let has_todos = !overdue.is_empty() || agenda.iter().any(|(_, _, days)| !days.is_empty());
+    if !has_todos {
         let empty = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).css_classes(["empty-state"]).build();
-        empty.append(&label("Nothing planned for this day.", &["empty-title"]));
+        empty.append(&label("No todos for this day.", &["empty-title"]));
         empty.append(&label("Add rows to a goal’s plan, paste a Notion table with Ctrl+V, or press + above to jot something down.", &["dim-label"]));
         page.append(&empty);
+    }
+
+    let goals = &store.goals;
+    let focuses: Vec<_> = agenda
+        .iter()
+        .flat_map(|(gi, ranges, _)| ranges.iter().map(move |&ri| (&goals[*gi], &goals[*gi].rows[ri])))
+        .collect();
+    if !focuses.is_empty() {
+        page.append(&focus_section(ui, &focuses));
     }
     drop(store);
     page
@@ -336,6 +372,10 @@ fn todo_row(
     if !notes.trim().is_empty() {
         let n = label(notes, &["todo-notes"]);
         n.set_margin_start(32);
+        // Keep the page to the todos: long notes are cut to two lines.
+        n.set_lines(2);
+        n.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        n.set_tooltip_text(Some(notes));
         row.append(&n);
     }
     row

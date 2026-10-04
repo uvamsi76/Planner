@@ -302,3 +302,23 @@ button.sync-hero {
   transform: scale(2.2);
   margin: 26px 0 22px 0;
 }
+
+/* ---- Week focus (collapsed section at the end of Today) ---- */
+.focus-section {
+  margin-top: 28px;
+}
+button.focus-toggle {
+  margin-left: -10px;
+  padding: 4px 10px;
+  opacity: 0.75;
+}
+button.focus-toggle:hover {
+  opacity: 1;
+}
+menubutton.sleep-button > button {
+  font-weight: normal;
+  opacity: 0.8;
+}
+.sleep-popover {
+  padding: 8px;
+}

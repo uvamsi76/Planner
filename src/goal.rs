@@ -55,8 +55,6 @@ pub fn page(ui: &Rc<Ui>, gid: u64) -> Option<Page> {
         }
     });
     header.pack_end(&gtk::MenuButton::builder().icon_name("view-more-symbolic").popover(&menu).build());
-    // Google Drive status: database icon with ✕ (signed out) or ✓ (synced).
-    header.pack_start(&crate::sync::status_button(ui));
     header.pack_end(&hide_past);
     delete_goal.connect_clicked({
         let ui = ui.clone();

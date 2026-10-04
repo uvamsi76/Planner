@@ -1,2 +1,4 @@
 /target
 /google-client.json
+# Google OAuth client files: never commit (GitHub blocks them anyway)
+client_secret_*.json

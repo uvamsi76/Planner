@@ -9,6 +9,19 @@ class ModelTest {
     private fun d(day: Int) = LocalDate.of(2026, 10, day)
 
     @Test
+    fun sleepWrapsPastMidnight() {
+        val night = Sleep()
+        assert(44 in night && 47 in night && 0 in night && 11 in night)
+        assert(12 !in night && 43 !in night)
+        assertEquals("22:00–06:00", night.label)
+        assert(27 in Sleep(26, 28) && 28 !in Sleep(26, 28))
+        assert(10 !in Sleep(10, 10))
+        // Desktop files carry it; older files without it get the default.
+        assertEquals(Sleep(40, 14), Store.fromJson("""{"goals":[],"next_id":0,"sleep":{"start":40,"end":14}}""").sleep)
+        assertEquals(Sleep(), Store.fromJson("""{"goals":[],"next_id":0}""").sleep)
+    }
+
+    @Test
     fun goalsOrderedByPriority() {
         var s = Store()
         s = s.newGoal("none").first

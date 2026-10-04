@@ -7,9 +7,11 @@
 //! Rules:
 //! - Every local save marks the account dirty and uploads ~2 s later.
 //! - On startup / sign-in / "Sync now": if Drive's copy changed since we last
-//!   saw it, download it; if we also have unsent changes (or this is the first
-//!   sign-in on a device that already has data), ask which copy to keep.
-//! - Before an upload, if Drive's copy changed underneath us, ask too.
+//!   saw it, download it, unless we also have unsent changes (or this is the
+//!   first sign-in on a device that already has data). Then this device's
+//!   data wins: it's uploaded over Drive's copy, and Drive's previous copy is
+//!   saved locally as `data.drive-backup.json`. No prompt.
+//! - Before an upload, if Drive's copy changed underneath us, the same rule applies.
 //! - Closing the window with unsent changes hides it, finishes the upload,
 //!   then quits.
 
@@ -341,13 +343,7 @@ fn handle(ui: &Rc<Ui>, result: cloud::Result<Outcome>) {
             mark_synced(ui, &meta);
         }
         Ok(Outcome::Conflict(meta, remote)) => {
-            if ui.sync.closing.get() {
-                // Can't ask now; keep the change marked dirty for next launch.
-                ui.window.destroy();
-                return;
-            }
-            set_status(ui, Status::Error("Choose which copy to keep".into()));
-            ask_conflict(ui, meta, remote);
+            keep_local(ui, &meta, &remote);
             return;
         }
         Err(e) => {
@@ -402,43 +398,16 @@ fn apply_remote(ui: &Rc<Ui>, remote: &str) {
     ui.show(ui.view.get());
 }
 
-fn ask_conflict(ui: &Rc<Ui>, meta: Meta, remote: String) {
-    let when = meta
-        .modified
-        .as_deref()
-        .and_then(|m| chrono::DateTime::parse_from_rfc3339(m).ok())
-        .map(|t| t.with_timezone(&chrono::Local).format("%a %-d %b, %H:%M").to_string())
-        .unwrap_or_else(|| "recently".into());
-    let goals = Store::from_json(&remote).map(|s| s.goals.len()).unwrap_or(0);
-    let dialog = adw::AlertDialog::new(
-        Some("Which plans should Planner keep?"),
-        Some(&format!(
-            "Google Drive has a different copy (changed {when}, {goals} goal{}) than this computer. \
-             The copy you don't keep is saved as a backup file next to your data.",
-            if goals == 1 { "" } else { "s" }
-        )),
-    );
-    dialog.add_responses(&[("later", "Decide later"), ("local", "Keep this computer’s"), ("drive", "Use Google Drive’s")]);
-    dialog.set_response_appearance("drive", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("drive"));
-    dialog.set_close_response("later");
-    dialog.connect_response(None, {
-        let ui = ui.clone();
-        move |_, response| match response {
-            "drive" => {
-                apply_remote(&ui, &remote);
-                mark_synced(&ui, &meta);
-            }
-            "local" => {
-                let backup = Store::path().with_extension("drive-backup.json");
-                let _ = std::fs::write(backup, &remote);
-                ui.sync.account.borrow_mut().version = meta.version.clone();
-                upload(&ui, true);
-            }
-            _ => set_status(&ui, Status::Error("Not synced yet — choose which copy to keep".into())),
-        }
-    });
-    dialog.present(Some(&ui.window));
+/// Both sides changed: this device's data wins and is uploaded over Drive's
+/// copy (no prompt). Drive's previous copy is kept as a local backup file.
+fn keep_local(ui: &Rc<Ui>, meta: &Meta, remote: &str) {
+    let backup = Store::path().with_extension("drive-backup.json");
+    if let Err(e) = std::fs::write(&backup, remote) {
+        ui.toast(&format!("Couldn't back up Drive's copy: {e}"));
+    }
+    ui.sync.account.borrow_mut().version = meta.version.clone();
+    save_account(ui);
+    upload(ui, true);
 }
 
 // ---------------------------------------------------------------- window

@@ -2,7 +2,7 @@
 //! then click or drag around the ring to give it time. Dragging over the
 //! task's own slots clears them; the eraser clears anything.
 
-use crate::model::{Block, SLOTS, slot_time};
+use crate::model::{Block, SLOTS, Sleep, slot_time};
 use crate::ui::{Ui, label};
 use adw::prelude::*;
 use chrono::{NaiveDate, Timelike};
@@ -91,7 +91,9 @@ pub fn panel(ui: &Rc<Ui>, date: NaiveDate, items: &Rc<Vec<Item>>) -> gtk::Widget
     }
     panel.append(&label(&summary, &["dim-label", "caption"]));
 
-    panel.append(&clock(ui, date, items));
+    let (clock, clock_state) = clock(ui, date, items);
+    panel.append(&clock);
+    panel.append(&sleep_control(ui, &clock, clock_state));
 
     let brush = ui.brush.get();
     let hint = match brush {
@@ -270,6 +272,7 @@ fn slot_angle(slot: f64) -> f64 {
 
 struct ClockState {
     date: NaiveDate,
+    sleep: Cell<Sleep>,
     slots: RefCell<BTreeMap<u8, u64>>,
     colors: Vec<(u64, Rgb, String)>,
     hover: Cell<Option<u8>>,
@@ -288,9 +291,10 @@ impl ClockState {
     }
 }
 
-fn clock(ui: &Rc<Ui>, date: NaiveDate, items: &[Item]) -> gtk::DrawingArea {
+fn clock(ui: &Rc<Ui>, date: NaiveDate, items: &[Item]) -> (gtk::DrawingArea, Rc<ClockState>) {
     let state = Rc::new(ClockState {
         date,
+        sleep: Cell::new(ui.store.borrow().sleep),
         slots: RefCell::new(ui.store.borrow().slots(date)),
         colors: items.iter().map(|i| (i.rid, i.color, i.title.clone())).collect(),
         hover: Cell::new(None),
@@ -407,7 +411,52 @@ fn clock(ui: &Rc<Ui>, date: NaiveDate, items: &[Item]) -> gtk::DrawingArea {
             None => glib::ControlFlow::Break,
         });
     }
-    area
+    (area, state)
+}
+
+/// "🌙 Sleep 22:00–06:00" button; its popover picks bedtime and wake-up.
+/// Saved in the data file, so the phone app shades the same hours.
+fn sleep_control(ui: &Rc<Ui>, area: &gtk::DrawingArea, state: Rc<ClockState>) -> gtk::MenuButton {
+    let sleep = state.sleep.get();
+    let text = gtk::Label::new(Some(&format!("🌙 Sleep {}", sleep.label())));
+    let times: Vec<String> = (0..SLOTS).map(slot_time).collect();
+    let refs: Vec<&str> = times.iter().map(String::as_str).collect();
+    let bed = gtk::DropDown::from_strings(&refs);
+    bed.set_selected(sleep.start as u32);
+    let wake = gtk::DropDown::from_strings(&refs);
+    wake.set_selected((sleep.end % SLOTS) as u32);
+
+    let grid = gtk::Grid::builder().row_spacing(8).column_spacing(12).css_classes(["sleep-popover"]).build();
+    grid.attach(&label("Bedtime", &[]), 0, 0, 1, 1);
+    grid.attach(&bed, 1, 0, 1, 1);
+    grid.attach(&label("Wake up", &[]), 0, 1, 1, 1);
+    grid.attach(&wake, 1, 1, 1, 1);
+    grid.attach(&label("Shaded darker on the clock.", &["dim-label", "caption"]), 0, 2, 2, 1);
+
+    let apply = {
+        let (ui, area, text, bed, wake) = (ui.clone(), area.clone(), text.clone(), bed.clone(), wake.clone());
+        move || {
+            let new = Sleep { start: bed.selected() as u8, end: wake.selected() as u8 };
+            ui.store.borrow_mut().sleep = new;
+            state.sleep.set(new);
+            text.set_text(&format!("🌙 Sleep {}", new.label()));
+            area.queue_draw();
+            ui.save_soon();
+        }
+    };
+    bed.connect_selected_notify({
+        let apply = apply.clone();
+        move |_| apply()
+    });
+    wake.connect_selected_notify(move |_| apply());
+
+    gtk::MenuButton::builder()
+        .child(&text)
+        .popover(&gtk::Popover::builder().child(&grid).build())
+        .css_classes(["flat", "sleep-button"])
+        .halign(gtk::Align::Center)
+        .tooltip_text("Set your sleep hours")
+        .build()
 }
 
 fn apply(ui: &Rc<Ui>, state: &ClockState, slot: u8, mode: Mode) {
@@ -443,14 +492,14 @@ fn draw(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32, state
         cr.arc(cx, cy, geo.outer, a0, a1);
         cr.arc_negative(cx, cy, geo.inner, a1, a0);
         cr.close_path();
-        let night = !(12..44).contains(&s); // before 6:00 and after 22:00
+        let night = state.sleep.get().contains(s);
         match slots.get(&s) {
             Some(rid) => {
                 let (r, g, b) = state.color_of(*rid);
                 cr.set_source_rgba(r, g, b, if hover == Some(s) { 1.0 } else { 0.88 });
             }
             None => {
-                let base = if night { 0.045 } else { 0.085 };
+                let base = if night { 0.025 } else { 0.085 };
                 cr.set_source_rgba(fr, fgc, fb, if hover == Some(s) { base + 0.12 } else { base });
             }
         }
@@ -503,7 +552,7 @@ fn draw(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32, state
     // Centre: the hovered slot, else the total.
     let (big, small) = match hover {
         Some(s) => {
-            let what = slots.get(&s).map(|rid| ellipsize(state.title_of(*rid), 22)).unwrap_or_else(|| "Free".into());
+            let what = slots.get(&s).map(|rid| ellipsize(state.title_of(*rid), 22)).unwrap_or_else(|| if state.sleep.get().contains(s) { "Sleep".into() } else { "Free".into() });
             (format!("{}–{}", slot_time(s), slot_time(s + 1)), what)
         }
         None => (duration(slots.len()), "planned".to_string()),

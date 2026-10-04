@@ -7,7 +7,7 @@ tablets):
 | Desktop | Android |
 |---|---|
 | Sidebar (Today, goals by priority, P-badges, counts) | Navigation drawer; a permanent sidebar on tablets (≥ 840 dp) |
-| Today page: todos + day-plan clock side by side | One scrolling column with the clock below the todos; side by side from 720 dp |
+| Today page: todos + day-plan clock side by side; week focuses collapsed at the end | One scrolling column: todos, then the clock (with 🌙 Sleep hours), then the collapsed week focuses; side by side from 720 dp |
 | "+" next to Today reveals quick add | Same "+" in the top bar |
 | Goal page: emoji icon, big title, Priority, Done·Date·Task·Notes table | Same. The table scrolls sideways on narrow screens and stretches to fill wide ones |
 | Drag column borders to resize | Drag the handles in the table header (remembered per goal on the device) |

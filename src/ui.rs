@@ -59,6 +59,8 @@ pub struct Ui {
     pub quick_goal: Cell<u32>,
     /// Whether the Today page's add-a-todo bar is open.
     pub quick_open: Cell<bool>,
+    /// Whether the Today page's "Week focus" section is expanded.
+    pub focus_open: Cell<bool>,
     pub quick: RefCell<Option<QuickAdd>>,
     pub quick_toggle: RefCell<Option<gtk::ToggleButton>>,
     /// What clicking/dragging on the day-plan clock paints.
@@ -151,6 +153,7 @@ pub fn build(app: &adw::Application, store: Store) -> Rc<Ui> {
         hide_past: Cell::new(false),
         quick_goal: Cell::new(0),
         quick_open: Cell::new(false),
+        focus_open: Cell::new(false),
         quick: RefCell::new(None),
         quick_toggle: RefCell::new(None),
         brush: Cell::new(crate::dayplan::Brush::None),

@@ -32,9 +32,9 @@ const val FILE_NAME = "planner-data.json"
 private const val API = "https://www.googleapis.com/drive/v3"
 private const val UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 private const val FOLDER_MIME = "application/vnd.google-apps.folder"
-private const val META_FIELDS = "id,version,modifiedTime,trashed,parents"
+private const val META_FIELDS = "id,version,trashed,parents"
 
-data class DriveMeta(val id: String, val version: String?, val modified: String?, val trashed: Boolean, val parents: List<String>)
+data class DriveMeta(val id: String, val version: String?, val trashed: Boolean, val parents: List<String>)
 
 class DriveException(message: String, val status: Int = 0) : IOException(message) {
     /** The token was rejected: the user has to sign in again. */
@@ -122,7 +122,6 @@ object Drive {
     private fun meta(o: JsonObject) = DriveMeta(
         id = o["id"]!!.jsonPrimitive.content,
         version = o["version"]?.jsonPrimitive?.content,
-        modified = o["modifiedTime"]?.jsonPrimitive?.content,
         trashed = o["trashed"]?.jsonPrimitive?.content == "true",
         parents = (o["parents"] as? JsonArray)?.map { it.jsonPrimitive.content }.orEmpty(),
     )

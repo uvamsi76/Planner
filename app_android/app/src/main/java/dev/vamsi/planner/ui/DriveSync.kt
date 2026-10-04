@@ -3,6 +3,9 @@ package dev.vamsi.planner.ui
 import android.app.Activity
 import android.app.Application
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
 import androidx.activity.result.IntentSenderRequest
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,6 +33,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.MessageDigest
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -39,9 +43,6 @@ sealed interface SyncStatus {
     data object Synced : SyncStatus
     data class Error(val message: String) : SyncStatus
 }
-
-/** Drive changed and so did we (or a first sign-in found data on both sides). */
-data class Conflict(val meta: DriveMeta, val remote: String)
 
 private object NeedsSignIn : Exception("Sign in to Google Drive again")
 
@@ -56,8 +57,9 @@ private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { c ->
  * desktop app's sync.rs:
  * - every local save marks the account dirty and uploads ~2 s later;
  * - on start/resume, if Drive's copy changed since we last saw it, download
- *   it; if we also have unsent changes, ask which copy to keep;
- * - before an upload, if Drive changed underneath us, ask too.
+ *   it — unless we also have unsent changes: then this phone's data wins and
+ *   is uploaded over Drive's copy (Drive's old copy is kept as a backup file);
+ * - before an upload, if Drive changed underneath us, the same rule applies.
  *
  * Tokens come from Google Play services' Authorization API: the app is
  * identified by its package name + signing certificate (an "Android" OAuth
@@ -74,8 +76,6 @@ class DriveSync(
     var account by mutableStateOf(SyncAccount.load(app))
         private set
     var status by mutableStateOf<SyncStatus>(if (account.signedIn) SyncStatus.Synced else SyncStatus.SignedOut)
-        private set
-    var conflict by mutableStateOf<Conflict?>(null)
         private set
     var signingIn by mutableStateOf(false)
         private set
@@ -103,29 +103,43 @@ class DriveSync(
     fun signIn(folder: String, launch: (IntentSenderRequest) -> Unit) {
         persist(account.withFolder(folder.ifBlank { account.folder }))
         signingIn = true
-        client.authorize(request)
-            .addOnSuccessListener { r ->
-                val pending = r.pendingIntent
-                if (r.hasResolution() && pending != null) launch(IntentSenderRequest.Builder(pending.intentSender).build())
-                else onAuthorized(r.accessToken)
-            }
-            .addOnFailureListener { e ->
-                signingIn = false
-                status = SyncStatus.Error(describe(e))
-            }
+        try {
+            client.authorize(request)
+                .addOnSuccessListener { r ->
+                    val pending = r.pendingIntent
+                    try {
+                        if (r.hasResolution() && pending != null) launch(IntentSenderRequest.Builder(pending.intentSender).build())
+                        else onAuthorized(r.accessToken)
+                    } catch (e: Exception) {
+                        fail("launching Google sign-in", e)
+                    }
+                }
+                .addOnFailureListener { e -> fail("authorize", e) }
+        } catch (e: Exception) {
+            // e.g. Google Play services missing on this device.
+            fail("authorize", e)
+        }
+    }
+
+    private fun fail(step: String, e: Throwable) {
+        Log.w(TAG, "Drive sign-in failed at $step", e)
+        signingIn = false
+        status = SyncStatus.Error(describe(e))
     }
 
     /** Result of Google's consent screen. */
     fun onConsentResult(resultCode: Int, data: Intent?) {
-        if (resultCode != Activity.RESULT_OK) {
-            signingIn = false
-            return
-        }
+        // Google reports failures (e.g. an unregistered app) inside the result
+        // intent, often with RESULT_CANCELED, so always ask it what happened.
         try {
+            if (data == null) {
+                signingIn = false
+                if (resultCode != Activity.RESULT_OK) status = SyncStatus.Error("Sign-in was cancelled")
+                return
+            }
             onAuthorized(client.getAuthorizationResultFromIntent(data).accessToken)
-        } catch (e: ApiException) {
-            signingIn = false
-            status = SyncStatus.Error(describe(e))
+        } catch (e: Exception) {
+            fail("consent result (resultCode=$resultCode)", e)
         }
     }
 
@@ -238,12 +252,10 @@ class DriveSync(
                             applyRemote(o.remote)
                             markSynced(o.meta)
                         }
-                        is Outcome.Clash -> {
-                            status = SyncStatus.Error("Choose which copy to keep")
-                            conflict = Conflict(o.meta, o.remote)
-                        }
+                        is Outcome.Clash -> keepLocal(o.meta, o.remote)
                     }
                 } catch (e: Exception) {
+                    Log.w(TAG, "Drive sync failed", e)
                     if (e === NeedsSignIn || (e is DriveException && e.isAuth)) {
                         persist(SyncAccount(folder = acct.folder, dirty = acct.dirty))
                         status = SyncStatus.SignedOut
@@ -273,30 +285,44 @@ class DriveSync(
         applyStore(store)
     }
 
-    fun resolveConflict(useDrive: Boolean?) {
-        val c = conflict ?: return
-        conflict = null
-        when (useDrive) {
-            true -> {
-                applyRemote(c.remote)
-                markSynced(c.meta)
-            }
-            false -> {
-                File(app.filesDir, "data.drive-backup.json").writeText(c.remote)
-                persist(account.copy(version = c.meta.version))
-                upload(force = true)
-            }
-            null -> status = SyncStatus.Error("Not synced yet — choose which copy to keep")
-        }
+    /**
+     * Both sides changed: this phone's data wins and is uploaded over Drive's
+     * copy (no prompt). Drive's previous copy is kept as a local backup file.
+     */
+    private fun keepLocal(meta: DriveMeta, remote: String) {
+        runCatching { File(app.filesDir, "data.drive-backup.json").writeText(remote) }
+            .onFailure { Log.w(TAG, "Couldn't back up Drive's copy", it) }
+        persist(account.copy(version = meta.version))
+        upload(force = true)
     }
 
     private fun describe(e: Throwable): String = when (e) {
         is ApiException -> when (e.statusCode) {
-            // DEVELOPER_ERROR: this package + signing key isn't registered as an Android client.
-            10 -> "This build isn't registered with Google yet (package name + SHA-1). See the README."
-            7 -> "No internet connection"
-            else -> "Google sign-in failed (${e.statusCode})"
+            // DEVELOPER_ERROR: this package + signing key isn't registered as an Android OAuth client.
+            10 -> "Google doesn't recognise this app yet. In Google Cloud Console → Clients, create an " +
+                "Android client with:\nPackage name: ${app.packageName}\nSHA-1: ${signingSha1() ?: "unknown"}\n" +
+                "(same project as the desktop client, with the Google Drive API enabled)."
+            7 -> "No internet connection."
+            16, 12501 -> "Sign-in was cancelled."
+            1, 2, 3, 9, 17, 18 -> "Google Play services is missing or out of date on this device (code ${e.statusCode})."
+            else -> "Google sign-in failed (code ${e.statusCode}): ${e.message ?: ""}".trimEnd(' ', ':')
         }
         else -> e.message ?: e.toString()
+    }
+
+    /** SHA-1 of the certificate this installed app is signed with, as Google Cloud wants it. */
+    fun signingSha1(): String? = runCatching {
+        val pm = app.packageManager
+        val cert = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pm.getPackageInfo(app.packageName, PackageManager.GET_SIGNING_CERTIFICATES).signingInfo?.apkContentsSigners?.firstOrNull()
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getPackageInfo(app.packageName, PackageManager.GET_SIGNATURES).signatures?.firstOrNull()
+        } ?: return null
+        MessageDigest.getInstance("SHA-1").digest(cert.toByteArray()).joinToString(":") { "%02X".format(it) }
+    }.getOrNull()
+
+    private companion object {
+        const val TAG = "PlannerDrive"
     }
 }
