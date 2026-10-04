@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Planner
+GenericName=Daily Planner
+Comment=Long-term plans turned into today's todos
+Exec=@BINDIR@/planner
+Icon=dev.vamsi.Planner
+Terminal=false
+Categories=Office;ProjectManagement;GTK;
+Keywords=todo;tasks;planner;goals;calendar;
+StartupNotify=true
+StartupWMClass=dev.vamsi.Planner

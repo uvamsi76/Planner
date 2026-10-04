@@ -1,32 +1,55 @@
 # Planner
 
-A Linux desktop todo app for long-term planning, written in Rust (egui).
+A small, native Ubuntu/GNOME app for long-term planning, written in Rust with
+GTK4 + libadwaita.
 
-Plan each goal (Career, Health, …) as a table of date-ranged rows. The home page
-shows everything those plans say to do on a given day.
+Plan each goal (Career, Health, …) as a simple table of dated rows. Every
+morning the **Today** page shows exactly what those plans say to do.
 
-## Run
+## Install
 
-```bash
-cargo run --release
-```
-
-Print a day's agenda in the terminal instead of opening the window:
+Needs the GTK4/libadwaita headers once:
 
 ```bash
-cargo run --release -- today            # today
-cargo run --release -- today 2026-10-13 # any date
+sudo apt install libgtk-4-dev libadwaita-1-dev
 ```
 
-Data is saved automatically to `~/.local/share/planner/data.json`. On first run
-it is seeded with a sample "Career — DSA" plan.
+Then build and install for your user (no sudo):
 
-## Using it
+```bash
+./install.sh
+```
 
-- **Goal page** (sidebar): one row per day for daily todos, or one row spanning
-  several days (e.g. a week) for a focus/milestone. Columns are customizable
-  under "Table columns"; the first column is the task title.
-- **Today page**: today's todos grouped by goal, week focuses shown as 📌,
-  unfinished past todos under "Carried over", plus a quick-add box.
+"Planner" now appears in the app grid; right-click it in the dock to pin it.
+Re-run `./install.sh` after pulling changes.
+
+For development: `cargo run`.
+
+## Use
+
+- **Goal pages** (sidebar, **+** to create): click the emoji to change it,
+  click the title to rename. The table has **Done · Date · Task · Notes**.
+  - Click a cell to edit it. **Enter** (or clicking anywhere else) finishes;
+    **Shift+Enter** starts a new line.
+  - The **+** at the far left of a week row adds a day of that week right
+    below it.
+  - Click a date to pick the start day and how many days it lasts. One day is
+    a daily todo; 7 days is a week focus.
+  - **+ New day**, **+ Next 7 days** and **+ Week focus** add rows after the
+    last one. Hover a row to delete it (with Undo).
+- **Today**: today's todos grouped by goal, 📌 week focuses, unfinished past
+  todos under "Carried over", and a quick-add box. ◀ ▶ or the calendar
+  browse other days.
+- **Import from Notion**: select your plan table in Notion, press Ctrl+C,
+  then press **Ctrl+V** anywhere in Planner. The import window shows what it
+  understood: week ranges, daily rows, and anything it skipped. Pick a new
+  or existing goal and click **Import**. Columns are detected automatically:
+  a date column ("5 Oct", "12–18 Oct", "26 Oct – 1 Nov", …), an optional Week
+  column, the task/topic column, and extra columns as notes. Markdown and
+  spreadsheet tables work too.
+- **Terminal**: `planner today` or `planner today 2026-10-13` prints a day's
+  agenda.
+
+Data lives in `~/.local/share/planner/data.json` and saves automatically.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized.

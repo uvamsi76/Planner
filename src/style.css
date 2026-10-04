@@ -1,0 +1,233 @@
+/* Notion-like, quiet styling on top of libadwaita. Colours come from the
+   system theme (light/dark + accent), so nothing here hard-codes a palette. */
+
+.page {
+  padding: 40px 56px 72px 56px;
+}
+
+/* ---- Page headings ---- */
+.page-eyebrow {
+  font-weight: 600;
+  opacity: 0.55;
+}
+.page-title {
+  font-size: 2.4em;
+  font-weight: 800;
+  margin: 2px 0 10px 0;
+}
+.page-icon {
+  font-size: 3.2em;
+  padding: 2px 6px;
+  min-height: 0;
+  margin-left: -6px;
+}
+entry.page-title-entry {
+  font-size: 2.4em;
+  font-weight: 800;
+  background: none;
+  box-shadow: none;
+  outline: none;
+  padding: 0;
+  min-height: 0;
+  margin: 4px 0 6px 0;
+}
+.page-hint {
+  margin-bottom: 24px;
+}
+.progress-row {
+  margin: 4px 0 8px 0;
+}
+.progress-row levelbar block {
+  min-height: 6px;
+  border-radius: 99px;
+}
+.progress-row levelbar block.filled {
+  background: var(--accent-bg-color);
+}
+
+/* ---- Today page ---- */
+.section-title {
+  font-size: 1.1em;
+  font-weight: 700;
+  margin-top: 24px;
+  margin-bottom: 6px;
+}
+.overdue-title {
+  color: var(--warning-color);
+}
+button.section-link {
+  font-size: 1.1em;
+  font-weight: 700;
+  margin: 26px 0 6px -10px;
+  padding: 4px 10px;
+}
+.callout {
+  background: alpha(currentColor, 0.055);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin: 4px 0 8px 0;
+}
+.callout-title {
+  font-weight: 700;
+}
+.callout-notes {
+  opacity: 0.7;
+}
+.todo {
+  padding: 4px 0;
+}
+.todo-text {
+  font-size: 1.05em;
+}
+.todo.done .todo-text {
+  text-decoration-line: line-through;
+  opacity: 0.5;
+}
+.todo-notes {
+  opacity: 0.6;
+  font-size: 0.92em;
+}
+.empty-state {
+  margin: 36px 0 12px 0;
+}
+.empty-title {
+  font-size: 1.15em;
+  font-weight: 600;
+}
+.quick-add {
+  margin-top: 32px;
+  padding-top: 16px;
+  border-top: 1px solid alpha(currentColor, 0.08);
+}
+button.small-button {
+  font-size: 0.9em;
+  min-height: 24px;
+  padding: 0 8px;
+}
+
+/* ---- Goal table ---- */
+.table-header {
+  padding: 6px 0;
+  border-bottom: 1px solid alpha(currentColor, 0.12);
+}
+.table-header label {
+  font-size: 0.85em;
+  font-weight: 600;
+  opacity: 0.55;
+}
+list.plan-table {
+  background: none;
+}
+list.plan-table > row {
+  padding: 1px 0;
+  border-bottom: 1px solid alpha(currentColor, 0.07);
+  transition: background 120ms;
+}
+list.plan-table > row:hover {
+  background: alpha(currentColor, 0.03);
+}
+list.plan-table > row.range {
+  background: alpha(var(--accent-bg-color), 0.1);
+}
+list.plan-table > row.range .cell.task label,
+list.plan-table > row.range .cell.task textview {
+  font-weight: 700;
+}
+list.plan-table > row.current menubutton.date-button > button {
+  color: var(--accent-color);
+  font-weight: 700;
+}
+list.plan-table > row.done .cell.task label {
+  text-decoration-line: line-through;
+  opacity: 0.5;
+}
+list.plan-table .cell {
+  min-height: 36px;
+  padding: 0 8px;
+  border-radius: 6px;
+  transition: background 120ms;
+}
+list.plan-table .cell:hover {
+  background: alpha(currentColor, 0.05);
+}
+list.plan-table .cell overlay > label {
+  padding: 8px 0;
+}
+list.plan-table .cell overlay > label.placeholder {
+  opacity: 0.35;
+}
+list.plan-table .cell textview.cell-editor,
+list.plan-table .cell textview.cell-editor > text {
+  background-color: transparent;
+}
+list.plan-table .cell:focus-within {
+  background: alpha(currentColor, 0.07);
+  box-shadow: inset 0 0 0 1px alpha(var(--accent-color), 0.6);
+}
+button.row-insert {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  opacity: 0.45;
+}
+button.row-insert:hover {
+  opacity: 1;
+}
+menubutton.date-button > button {
+  font-weight: normal;
+  min-width: 112px;
+}
+.row-delete {
+  opacity: 0;
+  transition: opacity 150ms;
+}
+list.plan-table > row:hover .row-delete {
+  opacity: 0.55;
+}
+list.plan-table > row .row-delete:hover {
+  opacity: 1;
+}
+.table-empty {
+  padding: 16px 4px;
+}
+.table-footer {
+  margin-top: 6px;
+}
+button.add-row,
+button.add-row label {
+  font-weight: normal;
+  opacity: 0.65;
+}
+button.add-row:hover {
+  opacity: 1;
+}
+.date-popover {
+  padding: 6px;
+}
+
+/* ---- Sidebar ---- */
+.sidebar-heading {
+  font-size: 0.8em;
+  font-weight: 700;
+  opacity: 0.5;
+  margin: 16px 18px 2px 18px;
+}
+.sidebar-count {
+  font-size: 0.85em;
+  font-weight: 600;
+  opacity: 0.55;
+}
+
+/* ---- Import dialog ---- */
+.import-body {
+  padding: 12px 24px 24px 24px;
+}
+textview.import-text {
+  font-size: 0.9em;
+}
+.preview-row {
+  padding: 10px 14px;
+}
+.preview-more {
+  padding: 10px 14px;
+}
