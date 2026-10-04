@@ -1,0 +1,6 @@
+<resources>
+    <!-- Only the window before Compose draws; Compose's MaterialTheme does the rest. -->
+    <style name="Theme.Planner" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFFFFFF</item>
+    </style>
+</resources>

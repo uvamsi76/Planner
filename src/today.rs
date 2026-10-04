@@ -1,7 +1,9 @@
 //! Home page: everything the long-term plans say to do on one day.
 
-use crate::model::fmt_range;
-use crate::ui::{Page, Ui, View, from_glib, label, scroller, to_glib};
+use crate::dayplan::{self, Item, first_line};
+use crate::layout::Split;
+use crate::model::{Block, fmt_range};
+use crate::ui::{Page, QuickAdd, Ui, View, from_glib, label, scroller, to_glib};
 use adw::prelude::*;
 use chrono::{Duration, NaiveDate};
 use gtk::glib;
@@ -16,8 +18,20 @@ pub fn page(ui: &Rc<Ui>) -> Page {
     arrows.append(&prev);
     arrows.append(&next);
     let today_btn = gtk::Button::with_label("Today");
+    // Small "+" that reveals the add-a-todo bar (hidden by default).
+    let add_toggle = gtk::ToggleButton::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add a todo for this day")
+        .active(ui.quick_open.get())
+        .build();
+    add_toggle.connect_toggled({
+        let ui = ui.clone();
+        move |b| set_quick_open(&ui, b.is_active())
+    });
+    ui.quick_toggle.replace(Some(add_toggle.clone()));
     header.pack_start(&arrows);
     header.pack_start(&today_btn);
+    header.pack_start(&add_toggle);
 
     let calendar = gtk::Calendar::new();
     calendar.set_date(&to_glib(ui.date.get()));
@@ -66,14 +80,82 @@ pub fn page(ui: &Rc<Ui>) -> Page {
     let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
     ui.set_today_holder(holder.clone());
     holder.append(&body(ui));
-    Page { title: "Today".into(), header, body: scroller(&holder) }
+    Page { title: "Today".into(), header, body: scroller(&holder, 1400) }
 }
 
-/// The scrollable content for `ui.date`.
-pub fn body(ui: &Rc<Ui>) -> gtk::Box {
+/// Open or close the add-a-todo bar (from the header "+" or Esc).
+fn set_quick_open(ui: &Rc<Ui>, open: bool) {
+    ui.quick_open.set(open);
+    if let Some(toggle) = ui.quick_toggle.borrow().as_ref()
+        && toggle.is_active() != open
+    {
+        toggle.set_active(open);
+    }
+    if let Some(q) = ui.quick.borrow().as_ref() {
+        q.revealer.set_reveal_child(open);
+        if open {
+            q.entry.grab_focus();
+        }
+    }
+}
+
+/// The scrollable content for `ui.date`: todos on the left, the day-plan
+/// clock on the right (stacked below when the window is narrow).
+pub fn body(ui: &Rc<Ui>) -> gtk::Widget {
     let date = ui.date.get();
-    let today = ui.today.get();
+    let (items, blocks) = plan_items(ui, date);
+    let items = Rc::new(items);
+    let main = todos(ui, date, &items, &blocks);
+    let side = dayplan::panel(ui, date, &items);
+    let split = Split::new(&main, &side, 360, 820);
     let page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["page"]).build();
+    page.append(&split);
+    page.upcast()
+}
+
+/// Everything schedulable on `date`, in priority order, each with a colour.
+fn plan_items(ui: &Rc<Ui>, date: NaiveDate) -> (Vec<Item>, Vec<Block>) {
+    let store = ui.store.borrow();
+    let mut rows: Vec<(u64, &crate::model::Goal)> = Vec::new();
+    if date == ui.today.get() {
+        rows.extend(store.overdue(date).into_iter().map(|(gi, ri)| (store.goals[gi].rows[ri].id, &store.goals[gi])));
+    }
+    for (gi, ranges, days) in store.agenda(date) {
+        let g = &store.goals[gi];
+        rows.extend(ranges.iter().chain(&days).map(|&ri| (g.rows[ri].id, g)));
+    }
+    let items = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (rid, g))| {
+            let task = g.rows.iter().find(|r| r.id == rid).map(|r| first_line(&r.task)).unwrap_or_default();
+            Item {
+                rid,
+                title: if task.is_empty() { "Untitled".into() } else { task },
+                goal: format!("{} {}", g.icon, crate::ui::display_name(&g.name)),
+                color: dayplan::color(i),
+            }
+        })
+        .collect();
+    (items, store.blocks(date))
+}
+
+/// Coloured dot + "09:00–10:30" for a row with time on the clock, if any.
+fn time_pill(rid: u64, items: &[Item], blocks: &[Block]) -> Option<gtk::Box> {
+    let times: Vec<String> = blocks.iter().filter(|b| b.row == rid).map(Block::label).collect();
+    if times.is_empty() {
+        return None;
+    }
+    let color = items.iter().find(|i| i.rid == rid).map(|i| i.color)?;
+    let pill = gtk::Box::builder().spacing(6).css_classes(["time-pill"]).valign(gtk::Align::Start).build();
+    pill.append(&dayplan::dot(color, 8));
+    pill.append(&gtk::Label::builder().label(times.join(", ")).css_classes(["caption", "numeric"]).build());
+    Some(pill)
+}
+
+fn todos(ui: &Rc<Ui>, date: NaiveDate, items: &Rc<Vec<Item>>, blocks: &[Block]) -> gtk::Box {
+    let today = ui.today.get();
+    let page = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
 
     let rel = match (date - today).num_days() {
         0 => "Today".to_string(),
@@ -96,6 +178,7 @@ pub fn body(ui: &Rc<Ui>) -> gtk::Box {
     progress_row.append(&progress);
     progress_row.append(&progress_text);
     page.append(&progress_row);
+    page.append(&quick_add(ui, date));
     let update_progress: Rc<dyn Fn()> = {
         let ui = ui.clone();
         Rc::new(move || {
@@ -116,6 +199,9 @@ pub fn body(ui: &Rc<Ui>) -> gtk::Box {
         for &(gi, ri) in &overdue {
             let (g, r) = (&store.goals[gi], &store.goals[gi].rows[ri]);
             let row = todo_row(ui, g.id, r.id, &r.task, "", r.done(), date, update_progress.clone());
+            if let Some(p) = time_pill(r.id, items, blocks) {
+                row.first_child().unwrap().downcast::<gtk::Box>().unwrap().append(&p);
+            }
             let meta = label(&format!("{} {} · {}", g.icon, g.name, fmt_range(r.start, r.end)), &["dim-label", "caption"]);
             meta.set_margin_start(32);
             row.append(&meta);
@@ -148,6 +234,9 @@ pub fn body(ui: &Rc<Ui>) -> gtk::Box {
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         hbox.append(&gtk::Label::new(Some(&g.icon)));
         hbox.append(&gtk::Label::new(Some(crate::ui::display_name(&g.name))));
+        if g.priority > 0 {
+            hbox.append(&crate::ui::priority_badge(g.priority));
+        }
         heading.set_child(Some(&hbox));
         heading.set_tooltip_text(Some("Open plan"));
         heading.connect_clicked({
@@ -170,6 +259,9 @@ pub fn body(ui: &Rc<Ui>) -> gtk::Box {
             let t = label(if r.task.is_empty() { "Untitled focus" } else { &r.task }, &["callout-title"]);
             t.set_hexpand(true);
             title.append(&t);
+            if let Some(p) = time_pill(r.id, items, blocks) {
+                title.append(&p);
+            }
             title.append(
                 &gtk::Label::builder()
                     .label(fmt_range(r.start, r.end))
@@ -185,19 +277,21 @@ pub fn body(ui: &Rc<Ui>) -> gtk::Box {
         }
         for &ri in days {
             let r = &g.rows[ri];
-            page.append(&todo_row(ui, g.id, r.id, &r.task, &r.notes, r.done(), date, update_progress.clone()));
+            let row = todo_row(ui, g.id, r.id, &r.task, &r.notes, r.done(), date, update_progress.clone());
+            if let Some(p) = time_pill(r.id, items, blocks) {
+                row.first_child().unwrap().downcast::<gtk::Box>().unwrap().append(&p);
+            }
+            page.append(&row);
         }
     }
 
     if agenda.is_empty() && overdue.is_empty() {
         let empty = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).css_classes(["empty-state"]).build();
         empty.append(&label("Nothing planned for this day.", &["empty-title"]));
-        empty.append(&label("Add rows to a goal’s plan, paste a Notion table with Ctrl+V, or jot something down below.", &["dim-label"]));
+        empty.append(&label("Add rows to a goal’s plan, paste a Notion table with Ctrl+V, or press + above to jot something down.", &["dim-label"]));
         page.append(&empty);
     }
     drop(store);
-
-    page.append(&quick_add(ui, date));
     page
 }
 
@@ -235,7 +329,10 @@ fn todo_row(
             ui.save_soon();
         }
     });
-    row.append(&check);
+    check.set_hexpand(true);
+    let line = gtk::Box::builder().spacing(8).build();
+    line.append(&check);
+    row.append(&line);
     if !notes.trim().is_empty() {
         let n = label(notes, &["todo-notes"]);
         n.set_margin_start(32);
@@ -244,9 +341,10 @@ fn todo_row(
     row
 }
 
-fn quick_add(ui: &Rc<Ui>, date: NaiveDate) -> gtk::Box {
+fn quick_add(ui: &Rc<Ui>, date: NaiveDate) -> gtk::Widget {
     let bar = gtk::Box::builder().spacing(8).css_classes(["quick-add"]).build();
     let store = ui.store.borrow();
+    ui.quick.replace(None);
     if store.goals.is_empty() {
         let b = gtk::Button::builder().label("Create your first goal").css_classes(["pill", "suggested-action"]).build();
         b.connect_clicked({
@@ -259,7 +357,7 @@ fn quick_add(ui: &Rc<Ui>, date: NaiveDate) -> gtk::Box {
             }
         });
         bar.append(&b);
-        return bar;
+        return bar.upcast();
     }
 
     let entry = gtk::Entry::builder()
@@ -299,34 +397,37 @@ fn quick_add(ui: &Rc<Ui>, date: NaiveDate) -> gtk::Box {
         move |_| submit()
     });
     add.connect_clicked(move |_| submit());
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let ui = ui.clone();
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                set_quick_open(&ui, false);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        }
+    });
+    entry.add_controller(keys);
 
     bar.append(&entry);
     bar.append(&goal);
     bar.append(&add);
-    bar
+    let revealer = gtk::Revealer::builder()
+        .child(&bar)
+        .reveal_child(ui.quick_open.get())
+        .transition_type(gtk::RevealerTransitionType::SlideDown)
+        .build();
+    ui.quick.replace(Some(QuickAdd { revealer: revealer.clone(), entry }));
+    revealer.upcast()
 }
 
 /// After a rebuild, put the cursor back in the (new) quick-add entry.
 fn refocus_quick_add(ui: &Rc<Ui>) {
     let ui = ui.clone();
     glib::idle_add_local_once(move || {
-        let Some(holder) = ui.today_holder_child() else { return };
-        if let Some(entry) = find_entry(&holder.upcast()) {
-            entry.grab_focus();
+        if let Some(q) = ui.quick.borrow().as_ref() {
+            q.entry.grab_focus();
         }
     });
-}
-
-fn find_entry(w: &gtk::Widget) -> Option<gtk::Entry> {
-    if w.has_css_class("quick-add") {
-        return w.first_child().and_then(|c| c.downcast().ok());
-    }
-    let mut child = w.first_child();
-    while let Some(c) = child {
-        if let Some(e) = find_entry(&c) {
-            return Some(e);
-        }
-        child = c.next_sibling();
-    }
-    None
 }

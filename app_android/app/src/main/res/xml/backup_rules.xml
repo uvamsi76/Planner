@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older: back up the plan data and layout prefs. -->
+<full-backup-content>
+    <include domain="file" path="data.json"/>
+    <include domain="sharedpref" path="layout.xml"/>
+</full-backup-content>

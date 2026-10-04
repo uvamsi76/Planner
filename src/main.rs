@@ -1,7 +1,11 @@
+mod cloud;
+mod dayplan;
 mod goal;
 mod import;
 mod import_dialog;
+mod layout;
 mod model;
+mod sync;
 mod today;
 mod ui;
 

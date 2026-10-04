@@ -1,6 +1,7 @@
 //! A goal's plan: page icon + title, then a plain table of
 //! Done · Date · Task · Notes rows.
 
+use crate::layout::{self, TableLine, Widths};
 use crate::model::{PlanRow, fmt_range};
 use crate::ui::{Page, Ui, View, display_name, from_glib, label, scroller, to_glib};
 use adw::prelude::*;
@@ -8,22 +9,22 @@ use chrono::{Duration, NaiveDate};
 use gtk::glib;
 use std::rc::Rc;
 
-/// Size groups keep the fixed-width columns aligned between header and rows.
-#[derive(Clone)]
-struct Columns {
-    insert: gtk::SizeGroup,
-    check: gtk::SizeGroup,
-    date: gtk::SizeGroup,
-    delete: gtk::SizeGroup,
-}
+/// Column widths shared by the header and every row of the table.
+type Columns = Rc<Widths>;
+
+const PRIORITIES: [&str; 5] = ["No priority", "P1 · Highest", "P2 · High", "P3 · Medium", "P4 · Low"];
 
 pub fn page(ui: &Rc<Ui>, gid: u64) -> Option<Page> {
     let today = ui.today.get();
-    let (name, icon, rows) = {
+    let (name, icon, priority, cols, rows) = {
         let mut store = ui.store.borrow_mut();
         let g = store.goal_mut(gid)?;
         g.sort_rows();
-        (g.name.clone(), g.icon.clone(), g.rows.clone())
+        let cols = Widths::new(
+            g.date_width.unwrap_or(layout::DEFAULT_DATE),
+            g.task_ratio.unwrap_or(layout::DEFAULT_RATIO),
+        );
+        (g.name.clone(), g.icon.clone(), g.priority, cols, g.rows.clone())
     };
 
     // Header bar: hide-past toggle and a menu with "Delete goal".
@@ -54,6 +55,8 @@ pub fn page(ui: &Rc<Ui>, gid: u64) -> Option<Page> {
         }
     });
     header.pack_end(&gtk::MenuButton::builder().icon_name("view-more-symbolic").popover(&menu).build());
+    // Google Drive status: database icon with ✕ (signed out) or ✓ (synced).
+    header.pack_start(&crate::sync::status_button(ui));
     header.pack_end(&hide_past);
     delete_goal.connect_clicked({
         let ui = ui.clone();
@@ -105,19 +108,33 @@ pub fn page(ui: &Rc<Ui>, gid: u64) -> Option<Page> {
     });
     page.append(&icon_btn);
     page.append(&title);
+
+    // Notion-style property row: Priority.
+    let prio = gtk::DropDown::from_strings(&PRIORITIES);
+    prio.set_selected(priority.min(4) as u32);
+    prio.add_css_class("flat");
+    prio.connect_selected_notify({
+        let ui = ui.clone();
+        move |d| {
+            if let Some(g) = ui.store.borrow_mut().goal_mut(gid) {
+                g.priority = d.selected() as u8;
+            }
+            ui.rebuild_sidebar();
+            ui.save_soon();
+        }
+    });
+    let props = gtk::Box::builder().spacing(12).css_classes(["page-props"]).build();
+    props.append(&label("Priority", &["dim-label", "prop-name"]));
+    props.append(&prio);
+    page.append(&props);
+
     page.append(&label(
         "One row per day for daily todos. Give a row a longer span (like a week) for a focus that shows on each of those days.",
         &["dim-label", "page-hint"],
     ));
 
     // The table.
-    let cols = Columns {
-        insert: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
-        check: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
-        date: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
-        delete: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
-    };
-    page.append(&table_header(&cols));
+    page.append(&table_header(ui, gid, &cols));
     let table = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["plan-table"])
@@ -157,35 +174,34 @@ pub fn page(ui: &Rc<Ui>, gid: u64) -> Option<Page> {
         });
     }
 
-    Some(Page { title: display_name(&name).to_string(), header, body: scroller(&page) })
+    Some(Page { title: display_name(&name).to_string(), header, body: scroller(&page, 1800) })
 }
 
-fn table_header(cols: &Columns) -> gtk::Box {
-    let header = gtk::Box::builder().spacing(6).css_classes(["table-header"]).build();
-    let insert = gtk::Label::new(None);
-    cols.insert.add_widget(&insert);
-    header.append(&insert);
-    let check = gtk::Label::new(None);
-    cols.check.add_widget(&check);
-    let date = label("Date", &[]);
-    cols.date.add_widget(&date);
-    let text = gtk::Box::builder().homogeneous(true).hexpand(true).spacing(6).build();
-    text.append(&label("Task", &[]));
-    text.append(&label("Notes", &[]));
-    let del = gtk::Label::new(None);
-    cols.delete.add_widget(&del);
-    header.append(&check);
-    header.append(&date);
-    header.append(&text);
-    header.append(&del);
-    header
+fn table_header(ui: &Rc<Ui>, gid: u64, cols: &Columns) -> gtk::Widget {
+    let blank = || gtk::Label::new(None).upcast::<gtk::Widget>();
+    // Indented to line up with the text inside the date button and cells.
+    let (date, task, notes) = (label("Date", &[]), label("Task", &[]), label("Notes", &[]));
+    date.set_margin_start(10);
+    task.set_margin_start(8);
+    notes.set_margin_start(8);
+    let ui = ui.clone();
+    layout::table_header(
+        cols,
+        [&blank(), &blank(), date.upcast_ref(), task.upcast_ref(), notes.upcast_ref(), &blank()],
+        move |date_width, task_ratio| {
+            if let Some(g) = ui.store.borrow_mut().goal_mut(gid) {
+                g.date_width = Some(date_width);
+                g.task_ratio = Some(task_ratio);
+            }
+            ui.save_soon();
+        },
+    )
 }
 
 fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::ListBox) -> gtk::ListBoxRow {
     let rid = r.id;
     let today = ui.today.get();
-    let line = gtk::Box::builder().spacing(6).build();
-    let row = gtk::ListBoxRow::builder().child(&line).activatable(false).selectable(false).build();
+    let row = gtk::ListBoxRow::builder().activatable(false).selectable(false).build();
     row.set_widget_name(&rid.to_string());
     let set_classes = {
         let row = row.clone();
@@ -213,11 +229,9 @@ fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::L
         });
         plus.upcast()
     };
-    cols.insert.add_widget(&insert);
 
     // Done
     let check = gtk::CheckButton::builder().active(r.done()).valign(gtk::Align::Center).build();
-    cols.check.add_widget(&check);
     check.connect_toggled({
         let (ui, set_classes) = (ui.clone(), set_classes.clone());
         move |c| {
@@ -231,13 +245,16 @@ fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::L
 
     // Date: calendar for the start, spin button for how many days it spans.
     // A child (not a label) so GTK doesn't add a dropdown arrow.
-    let date_text = gtk::Label::builder().label(fmt_range(r.start, r.end)).xalign(0.0).build();
+    let date_text = gtk::Label::builder()
+        .label(fmt_range(r.start, r.end))
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
     let date_btn = gtk::MenuButton::builder()
         .child(&date_text)
         .css_classes(["flat", "date-button"])
         .tooltip_text("Change date or span")
         .build();
-    cols.date.add_widget(&date_btn);
     let calendar = gtk::Calendar::new();
     calendar.set_date(&to_glib(r.start));
     let span = gtk::SpinButton::with_range(1.0, 366.0, 1.0);
@@ -271,17 +288,16 @@ fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::L
     });
     span.connect_value_changed(move |s| apply_dates(None, Some(s.value() as i64)));
 
-    // Task + Notes share the remaining width equally (same as the header).
-    let text = gtk::Box::builder().homogeneous(true).hexpand(true).spacing(6).build();
-    for (value, class, is_task) in [(&r.task, "task", true), (&r.notes, "notes", false)] {
+    // Task and Notes; their widths come from the shared (resizable) columns.
+    let [task, notes] = [(&r.task, "task", true), (&r.notes, "notes", false)].map(|(value, class, is_task)| {
         let ui = ui.clone();
-        text.append(&cell(value, if is_task { "Untitled" } else { "" }, class, move |v| {
+        cell(value, if is_task { "Untitled" } else { "" }, class, move |v| {
             if let Some(r) = ui.store.borrow_mut().goal_mut(gid).and_then(|g| g.row_mut(rid)) {
                 if is_task { r.task = v.to_string() } else { r.notes = v.to_string() }
             }
             ui.save_soon();
-        }));
-    }
+        })
+    });
 
     // Delete (appears on hover), with undo.
     let del = gtk::Button::builder()
@@ -290,7 +306,6 @@ fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::L
         .valign(gtk::Align::Center)
         .css_classes(["flat", "row-delete"])
         .build();
-    cols.delete.add_widget(&del);
     del.connect_clicked({
         let (ui, row, table) = (ui.clone(), row.clone(), table.clone());
         move |_| {
@@ -298,7 +313,9 @@ fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::L
                 let mut store = ui.store.borrow_mut();
                 let Some(g) = store.goal_mut(gid) else { return };
                 let Some(i) = g.rows.iter().position(|r| r.id == rid) else { return };
-                (i, g.rows.remove(i))
+                let removed = (i, g.rows.remove(i));
+                store.unschedule_row(rid);
+                removed
             };
             table.remove(&row);
             ui.save_soon();
@@ -317,11 +334,8 @@ fn row_widget(ui: &Rc<Ui>, gid: u64, r: &PlanRow, cols: &Columns, table: &gtk::L
         }
     });
 
-    line.append(&insert);
-    line.append(&check);
-    line.append(&date_btn);
-    line.append(&text);
-    line.append(&del);
+    let line = TableLine::new(cols, [&insert, check.upcast_ref(), date_btn.upcast_ref(), task.upcast_ref(), notes.upcast_ref(), del.upcast_ref()]);
+    row.set_child(Some(&line));
     row
 }
 

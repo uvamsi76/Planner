@@ -39,8 +39,12 @@ src/
 ├── main.rs     Entry: load Store, `planner today [date]` CLI, else start adw::Application
 ├── model.rs    Data types, JSON persistence + migration, date queries, sample data (no GUI)
 ├── ui.rs       Window shell: sidebar, navigation, debounced save, toasts, shared helpers
-├── today.rs    Today page: header (◀ ▶ Today, calendar), agenda, carried-over, quick add
-├── goal.rs     Goal page: emoji icon, title, Done·Date·Task·Notes table, add/delete rows
+├── today.rs    Today page: header (◀ ▶ Today, +, calendar), todos by priority, hidden quick add
+├── dayplan.rs  Today's "Day plan": 24 h clock of half-hour slots, task chips, schedule list
+├── goal.rs     Goal page: icon, title, priority, Done·Date·Task·Notes table, add/delete rows
+├── layout.rs   Custom layout managers: resizable table columns, two-column Today split
+├── cloud.rs    Google token from GNOME Online Accounts (D-Bus) + Drive v3 calls; blocking
+├── sync.rs     Drive sync on the GTK side: status icon, sign-in window, pull/push, conflicts
 ├── import.rs   Pasted table → plan rows: Markdown/TSV/HTML readers, date parser, column roles (no GUI, unit-tested)
 ├── import_dialog.rs  "Import a plan" dialog: clipboard, live preview, import with undo
 └── style.css   Notion-like styling on top of libadwaita (embedded via include_str!)
@@ -53,15 +57,20 @@ data/
 install.sh      Build + per-user install (binary, icon, launcher); no sudo
 ```
 
-Dependency direction is one-way: `main → ui → {today, goal, import_dialog} → {model, import}`.
+Dependency direction is one-way: `main → ui → {today, dayplan, goal, import_dialog} → {layout, model, import}`.
 `model.rs` knows nothing about GTK, so the CLI and future tests reuse it.
 
 ## Data model (`model.rs`)
 
 ```rust
-Store { goals: Vec<Goal>, next_id: u64 }
+Store { goals: Vec<Goal>, next_id: u64,
+        schedule: BTreeMap<NaiveDate, BTreeMap<u8 /* slot 0..48 */, u64 /* row id */>> }
 
-Goal    { id, name, icon /* emoji */, rows: Vec<PlanRow> }
+Goal    { id, name, icon /* emoji */,
+          priority: u8,                 // 1 = P1 (highest) … 4 = P4, 0 = none
+          date_width: Option<i32>,      // remembered table layout
+          task_ratio: Option<f64>,
+          rows: Vec<PlanRow> }
 
 PlanRow { id, start: NaiveDate, end: NaiveDate,
           task: String, notes: String,
@@ -73,6 +82,10 @@ PlanRow { id, start: NaiveDate, end: NaiveDate,
   valid when rows are added, deleted or re-sorted.
 - `start <= end` always holds: the UI edits a row as *start date + "lasts N days"*.
 - Completion is per row: a range row checked once is done for the whole range.
+- **Schedule:** each day maps half-hour slots (0 = 00:00, 47 = 23:30) to the
+  row id doing them. Row ids are globally unique, so no goal id is needed.
+  Rows that no longer exist are ignored when reading (`slots`), and deleting a
+  row calls `unschedule_row`.
 
 ### Queries
 
@@ -83,6 +96,9 @@ PlanRow { id, start: NaiveDate, end: NaiveDate,
 | `Store::progress(date)` | `(done, total)` over day rows on `date` | Today progress bar |
 | `Goal::next_free_date(ranges, today)` | day after the last day row (or range row), else today | "+ New day / Next 7 days / Week focus" |
 | `Goal::sort_rows()` | by `(start, end desc, id)`, so a week precedes its days | each time a goal page opens |
+| `Store::goal_order()` | goal indices by priority (P1 first, none last), stable | sidebar, `agenda`, `overdue` |
+| `Store::blocks(date)` | the day's slots merged into `Block { start, len, row }` runs | clock list, time pills |
+| `Store::set_slot(date, slot, row?)` | assign / clear one slot (empty days are dropped) | clock painting |
 
 ## Persistence
 
@@ -112,6 +128,8 @@ Ui {
     date: Cell<NaiveDate>,          // day shown on the Today page
     today: Cell<NaiveDate>,         // real calendar day (midnight check every 30 s)
     hide_past, quick_goal, …        // small view preferences (not persisted)
+    quick_open, quick, quick_toggle // Today's hidden add-a-todo bar + its header "+"
+    brush: Cell<Brush>              // what the day-plan clock paints: None | Row(id) | Eraser
     + widget handles: window, split view, content page, sidebar lists, toasts
 }
 ```
@@ -140,26 +158,71 @@ adw::ApplicationWindow
 
 ### Today page (`today.rs`)
 
-- Header: ◀ ▶ (linked), "Today", and a calendar popover. These change
-  `ui.date` and call `refresh_today()`, which rebuilds only the page body, so
-  the header and open popover survive.
-- Body: eyebrow ("Tomorrow"), big date title, progress bar; "Carried over"
-  (only on the real today) with "Move to today"; per-goal sections (heading
-  links to the goal page, 📌 callouts for ranges, checkboxes for days); quick
-  add (entry + goal dropdown).
+- Header: ◀ ▶ (linked), "Today", **+**, and a calendar popover. Changing the
+  date calls `refresh_today()`, which rebuilds only the page body, so the
+  header and an open popover survive.
+- **+** is a toggle that reveals the add-a-todo bar (`gtk::Revealer`: entry +
+  goal dropdown) under the date and focuses it. Esc closes it.
+  `ui.quick_open` keeps it open across rebuilds, so you can add several in a
+  row.
+- Body is a `layout::Split`: todos on the left, `dayplan::panel` on the right
+  (360 px). Below 820 px of page width they stack, with the clock under the
+  todos.
+- Left column: eyebrow ("Tomorrow"), big date title, progress bar;
+  "Carried over" (only on the real today) with "Move to today"; per-goal
+  sections in **priority order** (the heading shows the P-badge and links to
+  the goal page), with 📌 callouts for ranges and checkboxes for days. A
+  todo with time on the clock shows a coloured pill ("09:00–10:30").
 - Ticking a box updates the store, the row's CSS class (strikethrough) and the
   progress bar in place.
+
+### Day plan (`dayplan.rs`)
+
+- **Items:** everything schedulable that day (carried-over todos, focuses,
+  todos) in priority order, each given a palette colour by position. The
+  same colour is used on the clock, chips and pills.
+- **Clock:** a `gtk::DrawingArea` drawn with cairo. It's a ring of 48
+  half-hour slots with midnight at the top, running clockwise. Night hours
+  are dimmer. It has hour ticks with labels every 3 h, a red "now" hand
+  (redrawn every minute, today only), and a centre read-out: the hovered
+  slot's time and task, or the day's total.
+- **Painting:** a `GestureDrag` on the clock.
+  - The selected brush decides what happens: a task chip paints that task,
+    and dragging that starts on one of its own slots erases only that task's
+    slots. The eraser clears any slot. With no brush, clicking a planned slot
+    picks up its task.
+  - Drag updates walk slot by slot the short way round, so fast drags don't
+    skip slots.
+  - The store updates live. On release the page is rebuilt (in an idle
+    callback, since the clock is part of what's rebuilt) to refresh pills,
+    chips and the list.
+- **Chips:** unscheduled tasks first (in priority order), then scheduled ones
+  with their total time, plus an Eraser. The **Schedule** list shows each
+  block with a ✕ to remove it.
 
 ### Goal page (`goal.rs`)
 
 - Notion-style header: emoji icon (`gtk::EmojiChooser` popover) and a large
   borderless title entry. Header bar: hide-past toggle, ⋮ menu → "Delete
   goal…" (`adw::AlertDialog` confirmation).
-- Table: a header row plus a `gtk::ListBox`. Each row is
-  `[+][check][date][Task | Notes][🗑]`. The fixed columns share
-  `gtk::SizeGroup`s with the header so they line up. Task and Notes sit in a
-  homogeneous box, so they split the remaining width equally in the header
-  and in every row. Each `ListBoxRow`'s widget name is its row id.
+- Property row under the title: **Priority** (`gtk::DropDown`). Changing it
+  re-sorts the sidebar and the Today page.
+- Table: a header plus a `gtk::ListBox`. Each row is a `layout::TableLine`
+  with six cells: `[+][check][date][Task][Notes][🗑]`. Every line on the
+  page shares one `Rc<Widths>` (Date width + Task share of the text width),
+  and a custom `gtk::LayoutManager` (`TableLayout`) places cells from it.
+  So the header and all rows always line up. Each `ListBoxRow`'s widget name
+  is its row id.
+- **Fluid width:** the goal page's clamp allows up to 1800 px, and Task and
+  Notes are proportional, so a maximized window gets a wider table.
+- **Resizing:** the header (`layout::table_header`) is an overlay with two
+  thin handles that light up on hover, placed by `get-child-position` at the
+  Date|Task and Task|Notes borders.
+  - The `GestureDrag` sits on the header itself, not on the moving handles,
+    and starts only within 8 px of a border.
+  - Dragging updates `Widths` and calls `Widths::changed()`, which
+    `queue_resize`s every registered line, since text re-wraps.
+  - On release the widths are saved to `goal.date_width` / `goal.task_ratio`.
 - **"+" on week rows** (`insert_day_in_week`): adds a day row for the week's
   first date without a todo (or its last day if all are taken). The row is
   inserted into the `ListBox` right after the nearest preceding row on screen,
@@ -258,10 +321,81 @@ An Undo toast either removes the new goal or restores the old rows.
 
 ## Tests
 
-`cargo test` runs the parser tests in `import.rs`: date formats, your real
+`cargo test` runs the cloud tests (query escaping, old settings files still
+load, changing folder, and reading Online Accounts without side effects), the
+model tests (priority ordering; slots → blocks, ignoring
+deleted rows; unscheduling) and the parser tests in `import.rs`: date formats, your real
 Notion Markdown (12 week ranges + 7 days, multi-line cells, notes), TSV
 quoting round-trip, HTML, choosing Markdown over Notion's broken HTML,
 reporting rows without dates, and headerless tables.
+
+## Google Drive sync (`cloud.rs`, `sync.rs`)
+
+The local file stays the working copy, and Drive holds the shared copy.
+
+**No sign-in of our own.** Google requires every API caller to be a
+registered OAuth client. Instead of shipping one (or asking users to create
+one), Planner borrows the Google account from Ubuntu Settings → Online
+Accounts. GNOME Online Accounts ("GOA") is GNOME's registered client, and it
+gives local apps access tokens over D-Bus:
+- `cloud::google_accounts()` calls `GetManagedObjects` on
+  `org.gnome.OnlineAccounts` and keeps accounts whose `ProviderType` is
+  `google` and that implement `OAuth2Based`. It reads `Id`, `Identity`
+  (email) and `AttentionNeeded`.
+- Each Drive request gets a fresh token from `OAuth2Based.GetAccessToken`
+  (GOA caches and refreshes it). A `NotAuthorized` error means GNOME needs
+  you to sign in again; the window then shows "Open Online Accounts…",
+  which runs `gnome-control-center online-accounts`.
+
+**Folder confinement:** GOA's token covers the whole Drive, so the
+"one folder" rule is enforced by Planner's own code:
+- The folder is found by name at the top of My Drive, or created there.
+- The data file is looked up only *inside* that folder by name, and a stored
+  `file_id` is only trusted if its `parents` include that folder.
+- Planner never lists or modifies anything else.
+- Query values are escaped (`quoted`) so a folder name can't break the query.
+
+**Settings file:** `~/.config/planner/google-drive.json` holds the GOA
+account id and email, the folder name, the Drive `file_id`, the file
+`version` last seen, a `dirty` flag (local changes not uploaded yet) and
+`last_sync`. It contains no tokens or secrets.
+
+**Drive layout:** `My Drive/<folder>/planner-data.json`, the same JSON as the
+local file. The first upload creates the folder and file (metadata first, then
+`PATCH …?uploadType=media`). Later uploads overwrite the content in place.
+Changing the folder clears `file_id`/`version`, so the next sync finds or
+creates the file there; if the new folder already has data, Planner asks
+which copy to keep.
+
+**Threading:** `cloud.rs` is blocking (`ureq` with rustls, 30 s timeout).
+`sync.rs` runs it with `gio::spawn_blocking` inside
+`glib::spawn_future_local`, so the UI never waits on the network. One sync
+runs at a time (`busy`), and changes made meanwhile set `again`.
+
+**When it syncs:**
+
+| Trigger | What happens |
+|---|---|
+| Local save (`Ui::save_soon` → `sync::local_saved`) | mark `dirty`, upload 2 s later (debounced) |
+| Startup, after sign-in, "Sync now" (`sync_now`) | no Drive file → upload. Drive unchanged → upload if `dirty`. Drive changed → download, unless we're `dirty` or this is a first sign-in with local data, then ask |
+| Before every upload | if Drive's `version` moved since we last saw it → ask instead of overwriting |
+| Window close with `dirty` | hide the window, finish the upload, then destroy it (`hold_close`) |
+
+**Conflicts** (`ask_conflict`): "Use Google Drive's" / "Keep this
+computer's" / "Decide later". The copy that isn't kept is written next to the
+data file (`data.before-drive.json` or `data.drive-backup.json`), so nothing
+is lost.
+
+**Status icon** (`sync::status_button`, in each goal page's header): a
+cairo-drawn database cylinder with a badge. Red ✕ = signed out, green ✓ =
+synced, blue arc = syncing, orange ! = error (the tooltip says what). All
+icons repaint on status changes, and the open sign-in window rebuilds
+itself.
+
+**Errors:** if the account disappears from Settings, Planner disconnects and
+shows a toast. Anything else, including "sign in again in Settings" and a
+token that lacks Drive access, shows the orange ! badge with the message,
+leaves the connection in place, and retries on the next save or "Sync now".
 
 ## Install / desktop integration
 
@@ -290,4 +424,6 @@ stripped, `panic="abort"`.
   A Notion table where a week's days have no dates would need a "spread a
   week's topics over its days" option.
 - Only row deletion has undo; goal deletion is confirmed but permanent.
-- No tests yet. `model.rs` is pure and is the obvious first target.
+- Sync is whole-file and last-writer-wins after the conflict prompt; there's
+  no per-row merge.
+- No UI tests; `model`, `import` and `cloud` have unit tests (`cargo test`).

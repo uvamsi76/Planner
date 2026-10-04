@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+: cloud backup and device-to-device transfer of the plan data. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="file" path="data.json"/>
+        <include domain="sharedpref" path="layout.xml"/>
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="data.json"/>
+        <include domain="sharedpref" path="layout.xml"/>
+    </device-transfer>
+</data-extraction-rules>

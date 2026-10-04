@@ -32,6 +32,12 @@ struct SideRow {
     count: gtk::Label,
 }
 
+/// The hidden "add a todo" bar on the Today page and its header toggle.
+pub struct QuickAdd {
+    pub revealer: gtk::Revealer,
+    pub entry: gtk::Entry,
+}
+
 pub struct Ui {
     pub store: RefCell<Store>,
     pub window: adw::ApplicationWindow,
@@ -51,6 +57,14 @@ pub struct Ui {
     pub today: Cell<NaiveDate>,
     pub hide_past: Cell<bool>,
     pub quick_goal: Cell<u32>,
+    /// Whether the Today page's add-a-todo bar is open.
+    pub quick_open: Cell<bool>,
+    pub quick: RefCell<Option<QuickAdd>>,
+    pub quick_toggle: RefCell<Option<gtk::ToggleButton>>,
+    /// What clicking/dragging on the day-plan clock paints.
+    pub brush: Cell<crate::dayplan::Brush>,
+    /// Google Drive account and sync status.
+    pub sync: crate::sync::State,
     save_pending: Cell<bool>,
 }
 
@@ -61,8 +75,8 @@ pub fn build(app: &adw::Application, store: Store) -> Rc<Ui> {
         .application(app)
         .title("Planner")
         .icon_name(crate::APP_ID)
-        .default_width(1180)
-        .default_height(780)
+        .default_width(1360)
+        .default_height(860)
         .build();
 
     // Sidebar: "Today", then the goals.
@@ -136,6 +150,11 @@ pub fn build(app: &adw::Application, store: Store) -> Rc<Ui> {
         today: Cell::new(today),
         hide_past: Cell::new(false),
         quick_goal: Cell::new(0),
+        quick_open: Cell::new(false),
+        quick: RefCell::new(None),
+        quick_toggle: RefCell::new(None),
+        brush: Cell::new(crate::dayplan::Brush::None),
+        sync: crate::sync::State::new(),
         save_pending: Cell::new(false),
     });
 
@@ -207,7 +226,12 @@ pub fn build(app: &adw::Application, store: Store) -> Rc<Ui> {
         let ui = ui.clone();
         move |_| {
             ui.save_now();
-            glib::Propagation::Proceed
+            // With unsent changes, the window hides and closes once uploaded.
+            if crate::sync::hold_close(&ui) {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
         }
     });
 
@@ -230,6 +254,7 @@ pub fn build(app: &adw::Application, store: Store) -> Rc<Ui> {
 
     ui.rebuild_sidebar();
     ui.show(View::Today);
+    crate::sync::startup(&ui);
     ui
 }
 
@@ -264,10 +289,6 @@ impl Ui {
         }
     }
 
-    pub fn today_holder_child(&self) -> Option<gtk::Box> {
-        self.today_holder.borrow().clone()
-    }
-
     pub fn set_today_holder(&self, holder: gtk::Box) {
         self.today_holder.replace(Some(holder));
     }
@@ -289,15 +310,23 @@ impl Ui {
         self.goal_list.remove_all();
         let mut rows = self.side_rows.borrow_mut();
         rows.clear();
-        for g in &self.store.borrow().goals {
+        let store = self.store.borrow();
+        for g in store.goal_order().into_iter().map(|i| &store.goals[i]) {
             let icon = gtk::Label::new(Some(&g.icon));
             let name = gtk::Label::new(Some(display_name(&g.name)));
             let count = count_label();
             let row = sidebar_row_widgets(&icon, &name, &count);
+            if g.priority > 0 {
+                // Badge goes before the count.
+                let badge = priority_badge(g.priority);
+                let line = row.child().unwrap();
+                badge.insert_before(&line, Some(&count));
+            }
             row.set_widget_name(&g.id.to_string());
             self.goal_list.append(&row);
             rows.insert(g.id, SideRow { row, icon, name, count });
         }
+        drop(store);
         drop(rows);
         if let View::Goal(id) = self.view.get() {
             let rows = self.side_rows.borrow();
@@ -338,13 +367,20 @@ impl Ui {
         let ui = self.clone();
         glib::timeout_add_local_once(Duration::from_millis(400), move || {
             ui.save_pending.set(false);
-            ui.save_now();
+            if ui.save_now() {
+                crate::sync::local_saved(&ui);
+            }
         });
     }
 
-    pub fn save_now(&self) {
-        if let Err(e) = self.store.borrow().save() {
-            self.toast(&format!("Could not save: {e}"));
+    /// Write the local file now. Returns false (after a toast) on failure.
+    pub fn save_now(&self) -> bool {
+        match self.store.borrow().save() {
+            Ok(()) => true,
+            Err(e) => {
+                self.toast(&format!("Could not save: {e}"));
+                false
+            }
         }
     }
 
@@ -383,11 +419,11 @@ pub fn display_name(name: &str) -> &str {
     if name.trim().is_empty() { "Untitled" } else { name }
 }
 
-/// Page content: centred, width-limited, scrollable.
-pub fn scroller(child: &impl IsA<gtk::Widget>) -> gtk::Widget {
+/// Page content: centred, at most `max_width` wide, scrollable.
+pub fn scroller(child: &impl IsA<gtk::Widget>, max_width: i32) -> gtk::Widget {
     let clamp = adw::Clamp::builder()
-        .maximum_size(1000)
-        .tightening_threshold(760)
+        .maximum_size(max_width)
+        .tightening_threshold(max_width * 3 / 4)
         .child(child)
         .build();
     gtk::ScrolledWindow::builder()
@@ -413,6 +449,16 @@ pub fn label(text: &str, classes: &[&str]) -> gtk::Label {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .css_classes(classes)
+        .build()
+}
+
+/// "P1"… badge, coloured by level (see style.css).
+pub fn priority_badge(priority: u8) -> gtk::Label {
+    gtk::Label::builder()
+        .label(format!("P{priority}"))
+        .valign(gtk::Align::Center)
+        .css_classes(["prio", &format!("prio-{priority}")])
+        .tooltip_text("Priority")
         .build()
 }
 

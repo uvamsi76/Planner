@@ -95,9 +95,7 @@ button.section-link {
   font-weight: 600;
 }
 .quick-add {
-  margin-top: 32px;
-  padding-top: 16px;
-  border-top: 1px solid alpha(currentColor, 0.08);
+  margin: 10px 0 4px 0;
 }
 button.small-button {
   font-size: 0.9em;
@@ -107,7 +105,7 @@ button.small-button {
 
 /* ---- Goal table ---- */
 .table-header {
-  padding: 6px 0;
+  padding: 2px 0;
   border-bottom: 1px solid alpha(currentColor, 0.12);
 }
 .table-header label {
@@ -175,7 +173,20 @@ button.row-insert:hover {
 }
 menubutton.date-button > button {
   font-weight: normal;
-  min-width: 112px;
+}
+.col-resize {
+  margin: 4px 4px;
+  border-radius: 2px;
+  transition: background 120ms;
+}
+.col-resize:hover {
+  background: alpha(var(--accent-bg-color), 0.7);
+}
+.page-props {
+  margin: 0 0 6px 0;
+}
+.prop-name {
+  min-width: 70px;
 }
 .row-delete {
   opacity: 0;
@@ -230,4 +241,64 @@ textview.import-text {
 }
 .preview-more {
   padding: 10px 14px;
+}
+
+/* ---- Priority ---- */
+.prio {
+  font-size: 0.72em;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 99px;
+}
+.prio-1 { color: #e5484d; background: alpha(#e5484d, 0.16); }
+.prio-2 { color: #f08c28; background: alpha(#f08c28, 0.16); }
+.prio-3 { color: #3e8ef7; background: alpha(#3e8ef7, 0.16); }
+.prio-4 { color: alpha(currentColor, 0.6); background: alpha(currentColor, 0.08); }
+
+/* ---- Day plan ---- */
+.day-plan-title {
+  margin-top: 8px;
+  margin-bottom: 0;
+}
+.clock {
+  margin: 8px 0 4px 0;
+}
+.day-plan-hint {
+  margin-bottom: 2px;
+}
+button.chip {
+  border-radius: 99px;
+  padding: 4px 12px;
+  font-weight: normal;
+}
+button.chip-active {
+  box-shadow: inset 0 0 0 2px var(--accent-color);
+  background: alpha(var(--accent-bg-color), 0.18);
+}
+.day-plan-subtitle {
+  margin-top: 8px;
+}
+.schedule-row {
+  padding: 6px 6px 6px 14px;
+}
+.schedule-time {
+  font-weight: 600;
+  min-width: 96px;
+}
+.time-pill {
+  padding: 1px 8px;
+  border-radius: 99px;
+  background: alpha(currentColor, 0.07);
+}
+
+/* ---- Google Drive ---- */
+button.sync-button {
+  padding: 4px 6px;
+}
+.sync-page {
+  padding: 8px 28px 28px 28px;
+}
+button.sync-hero {
+  transform: scale(2.2);
+  margin: 26px 0 22px 0;
 }

@@ -6,7 +6,7 @@
 
 use chrono::{Duration, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf};
+use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PlanRow {
@@ -53,6 +53,15 @@ pub struct Goal {
     pub name: String,
     #[serde(default = "default_icon")]
     pub icon: String,
+    /// 1 (highest) … 4 (lowest); 0 = no priority.
+    #[serde(default)]
+    pub priority: u8,
+    /// Table layout remembered per goal: Date column width (px) and the
+    /// Task share of the Task + Notes width.
+    #[serde(default)]
+    pub date_width: Option<i32>,
+    #[serde(default)]
+    pub task_ratio: Option<f64>,
     pub rows: Vec<PlanRow>,
 }
 
@@ -94,10 +103,40 @@ impl Goal {
     }
 }
 
+/// Half-hour slots in a day.
+pub const SLOTS: u8 = 48;
+
+/// A run of consecutive half-hour slots given to one row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Block {
+    pub start: u8,
+    pub len: u8,
+    pub row: u64,
+}
+
+impl Block {
+    pub fn label(&self) -> String {
+        format!("{}–{}", slot_time(self.start), slot_time(self.start + self.len))
+    }
+}
+
+/// "09:30" for slot 19; slot 48 is "24:00".
+pub fn slot_time(slot: u8) -> String {
+    format!("{:02}:{:02}", slot / 2, if slot % 2 == 1 { 30 } else { 0 })
+}
+
+/// Sort key for a goal priority: P1 first, "none" last.
+pub fn priority_rank(p: u8) -> u8 {
+    if p == 0 { 5 } else { p }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Store {
     pub goals: Vec<Goal>,
     next_id: u64,
+    /// Day plans: date → half-hour slot (0..48) → row id doing it.
+    #[serde(default)]
+    pub schedule: BTreeMap<NaiveDate, BTreeMap<u8, u64>>,
 }
 
 impl Store {
@@ -131,6 +170,13 @@ impl Store {
             fs::write(Self::path().with_extension("v1.json"), &json)?;
             store.save()?;
         }
+        Ok(store)
+    }
+
+    /// Parse data from elsewhere (e.g. Google Drive), upgrading old formats.
+    pub fn from_json(json: &str) -> Result<Store, String> {
+        let mut store: Store = serde_json::from_str(json).map_err(|e| format!("Not Planner data: {e}"))?;
+        store.migrate();
         Ok(store)
     }
 
@@ -172,15 +218,23 @@ impl Store {
 
     pub fn new_goal(&mut self, name: &str) -> u64 {
         let id = self.next_id();
-        self.goals.push(Goal { id, name: name.into(), icon: default_icon(), rows: Vec::new() });
+        self.goals.push(Goal {
+            id,
+            name: name.into(),
+            icon: default_icon(),
+            priority: 0,
+            date_width: None,
+            task_ratio: None,
+            rows: Vec::new(),
+        });
         id
     }
 
     /// Everything planned for `date`, grouped by goal: (goal index, range rows, day rows).
     pub fn agenda(&self, date: NaiveDate) -> Vec<(usize, Vec<usize>, Vec<usize>)> {
-        self.goals
-            .iter()
-            .enumerate()
+        self.goal_order()
+            .into_iter()
+            .map(|gi| (gi, &self.goals[gi]))
             .filter_map(|(gi, g)| {
                 let (mut ranges, mut days) = (Vec::new(), Vec::new());
                 for (ri, r) in g.rows.iter().enumerate() {
@@ -196,14 +250,70 @@ impl Store {
     /// Unfinished single-day todos from before `date`: (goal index, row index).
     pub fn overdue(&self, date: NaiveDate) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
-        for (gi, g) in self.goals.iter().enumerate() {
-            for (ri, r) in g.rows.iter().enumerate() {
+        for gi in self.goal_order() {
+            for (ri, r) in self.goals[gi].rows.iter().enumerate() {
                 if r.is_day() && r.end < date && !r.done() {
                     out.push((gi, ri));
                 }
             }
         }
         out
+    }
+
+    /// Goal indices by priority (P1 first, no priority last), otherwise in
+    /// creation order.
+    pub fn goal_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.goals.len()).collect();
+        order.sort_by_key(|&i| priority_rank(self.goals[i].priority));
+        order
+    }
+
+    pub fn row(&self, rid: u64) -> Option<(&Goal, &PlanRow)> {
+        self.goals.iter().find_map(|g| g.rows.iter().find(|r| r.id == rid).map(|r| (g, r)))
+    }
+
+    /// Assign (or with `None`, clear) one half-hour slot on `date`.
+    pub fn set_slot(&mut self, date: NaiveDate, slot: u8, row: Option<u64>) {
+        let day = self.schedule.entry(date).or_default();
+        match row {
+            Some(rid) => {
+                day.insert(slot, rid);
+            }
+            None => {
+                day.remove(&slot);
+            }
+        }
+        if day.is_empty() {
+            self.schedule.remove(&date);
+        }
+    }
+
+    /// Slot → row for `date`, ignoring rows that no longer exist.
+    pub fn slots(&self, date: NaiveDate) -> BTreeMap<u8, u64> {
+        self.schedule
+            .get(&date)
+            .map(|day| day.iter().filter(|(_, rid)| self.row(**rid).is_some()).map(|(s, r)| (*s, *r)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The day's slots merged into runs, in time order.
+    pub fn blocks(&self, date: NaiveDate) -> Vec<Block> {
+        let mut out: Vec<Block> = Vec::new();
+        for (slot, rid) in self.slots(date) {
+            match out.last_mut() {
+                Some(b) if b.row == rid && b.start + b.len == slot => b.len += 1,
+                _ => out.push(Block { start: slot, len: 1, row: rid }),
+            }
+        }
+        out
+    }
+
+    /// Forget a deleted row's time slots on every day.
+    pub fn unschedule_row(&mut self, rid: u64) {
+        for day in self.schedule.values_mut() {
+            day.retain(|_, r| *r != rid);
+        }
+        self.schedule.retain(|_, day| !day.is_empty());
     }
 
     /// (done, total) over the single-day todos on `date`.
@@ -273,5 +383,55 @@ pub fn fmt_range(start: NaiveDate, end: NaiveDate) -> String {
         format!("{}–{}", start.format("%-d"), end.format("%-d %b"))
     } else {
         format!("{} – {}", start.format("%-d %b"), end.format("%-d %b"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
+    }
+
+    #[test]
+    fn goals_ordered_by_priority() {
+        let mut s = Store::default();
+        let a = s.new_goal("none");
+        let b = s.new_goal("p3");
+        let c = s.new_goal("p1");
+        s.goal_mut(b).unwrap().priority = 3;
+        s.goal_mut(c).unwrap().priority = 1;
+        let names: Vec<_> = s.goal_order().iter().map(|&i| s.goals[i].name.clone()).collect();
+        assert_eq!(names, ["p1", "p3", "none"]);
+        let _ = a;
+    }
+
+    #[test]
+    fn slots_merge_into_blocks_and_ignore_deleted_rows() {
+        let mut s = Store::default();
+        let g = s.new_goal("g");
+        let (r1, r2) = (s.next_id(), s.next_id());
+        s.goal_mut(g).unwrap().add_row(r1, d(5), d(5));
+        s.goal_mut(g).unwrap().add_row(r2, d(5), d(5));
+        for slot in [18, 19, 20] {
+            s.set_slot(d(5), slot, Some(r1));
+        }
+        s.set_slot(d(5), 21, Some(r2));
+        s.set_slot(d(5), 30, Some(r1));
+        s.set_slot(d(5), 40, Some(999)); // row that doesn't exist
+        assert_eq!(
+            s.blocks(d(5)),
+            vec![
+                Block { start: 18, len: 3, row: r1 },
+                Block { start: 21, len: 1, row: r2 },
+                Block { start: 30, len: 1, row: r1 },
+            ]
+        );
+        assert_eq!(s.blocks(d(5))[0].label(), "09:00–10:30");
+        s.set_slot(d(5), 21, None);
+        s.unschedule_row(r1);
+        s.unschedule_row(999);
+        assert!(s.schedule.is_empty());
     }
 }

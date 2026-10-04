@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Planner</string>
+    <string name="share_label">Import into Planner</string>
+</resources>

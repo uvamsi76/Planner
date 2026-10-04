@@ -1,0 +1,14 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- page shadow, page, red header -->
+    <path android:fillColor="#591F3F99" android:pathData="M38,35h32a6,6 0,0 1,6 6v38a6,6 0,0 1,-6 6h-32a6,6 0,0 1,-6 -6v-38a6,6 0,0 1,6 -6z"/>
+    <path android:fillColor="#FFFFFFFF" android:pathData="M38,33h32a6,6 0,0 1,6 6v38a6,6 0,0 1,-6 6h-32a6,6 0,0 1,-6 -6v-38a6,6 0,0 1,6 -6z"/>
+    <path android:fillColor="#FFE8504D" android:pathData="M38,33h32a6,6 0,0 1,6 6v4h-44v-4a6,6 0,0 1,6 -6z"/>
+    <!-- two ticked boxes and an empty one -->
+    <path android:fillColor="#FF3461D1" android:pathData="M39,48h7a1.5,1.5 0,0 1,1.5 1.5v7a1.5,1.5 0,0 1,-1.5 1.5h-7a1.5,1.5 0,0 1,-1.5 -1.5v-7a1.5,1.5 0,0 1,1.5 -1.5z"/>
+    <path android:fillColor="#FF3461D1" android:pathData="M39,61h7a1.5,1.5 0,0 1,1.5 1.5v7a1.5,1.5 0,0 1,-1.5 1.5h-7a1.5,1.5 0,0 1,-1.5 -1.5v-7a1.5,1.5 0,0 1,1.5 -1.5z"/>
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="1.8" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M40,53l2,2 3.5,-4M40,66l2,2 3.5,-4"/>
+    <path android:strokeColor="#FF9AA6BD" android:strokeWidth="1.8" android:pathData="M38.5,75.5h7v-0.01"/>
+    <path android:strokeColor="#FF9AA6BD" android:strokeWidth="3" android:strokeLineCap="round" android:pathData="M52,53h18M52,66h14"/>
+    <path android:strokeColor="#FFC9D0DD" android:strokeWidth="3" android:strokeLineCap="round" android:pathData="M52,77h16"/>
+</vector>
