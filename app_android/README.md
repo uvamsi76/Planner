@@ -46,6 +46,12 @@ so it can sit next to the Play version.
 
 ## Publishing to Google Play
 
+> **Already done on this machine:** the upload key is `~/Android/keys/planner-upload.jks`
+> and its passwords are in `app_android/keystore.properties` (both private to your user
+> and git-ignored). Back up **both files** somewhere safe, such as a password manager.
+> With Play App Signing on, a lost upload key can be reset through Play support, but
+> that takes days.
+
 1. **Create an upload key** (once; keep it safe, it's not in git):
    ```bash
    keytool -genkeypair -v -keystore ~/planner-upload.jks -alias upload \
