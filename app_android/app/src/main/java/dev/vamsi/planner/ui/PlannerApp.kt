@@ -82,6 +82,7 @@ fun PlannerApp(vm: PlannerViewModel) {
     }
 
     if (vm.importText != null) ImportDialog(vm)
+    ConflictDialog(vm)
 }
 
 /** Today, then goals by priority with P-badges and today's remaining counts. */

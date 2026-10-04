@@ -1,0 +1,302 @@
+package dev.vamsi.planner.ui
+
+import android.app.Activity
+import android.app.Application
+import android.content.Intent
+import androidx.activity.result.IntentSenderRequest
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.ClearTokenRequest
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.auth.api.identity.RevokeAccessRequest
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
+import com.google.android.gms.tasks.Task
+import dev.vamsi.planner.data.DRIVE_SCOPE
+import dev.vamsi.planner.data.Drive
+import dev.vamsi.planner.data.DriveException
+import dev.vamsi.planner.data.DriveMeta
+import dev.vamsi.planner.data.Store
+import dev.vamsi.planner.data.SyncAccount
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.io.File
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+sealed interface SyncStatus {
+    data object SignedOut : SyncStatus
+    data object Syncing : SyncStatus
+    data object Synced : SyncStatus
+    data class Error(val message: String) : SyncStatus
+}
+
+/** Drive changed and so did we (or a first sign-in found data on both sides). */
+data class Conflict(val meta: DriveMeta, val remote: String)
+
+private object NeedsSignIn : Exception("Sign in to Google Drive again")
+
+private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { c ->
+    addOnSuccessListener { c.resume(it) }
+    addOnFailureListener { c.resumeWithException(it) }
+    addOnCanceledListener { c.cancel() }
+}
+
+/**
+ * Keeps the local file and Google Drive in step — the same rules as the
+ * desktop app's sync.rs:
+ * - every local save marks the account dirty and uploads ~2 s later;
+ * - on start/resume, if Drive's copy changed since we last saw it, download
+ *   it; if we also have unsent changes, ask which copy to keep;
+ * - before an upload, if Drive changed underneath us, ask too.
+ *
+ * Tokens come from Google Play services' Authorization API: the app is
+ * identified by its package name + signing certificate (an "Android" OAuth
+ * client in the same Google Cloud project as the desktop app). Once granted,
+ * `authorize()` returns a fresh token silently.
+ */
+class DriveSync(
+    private val app: Application,
+    private val scope: CoroutineScope,
+    private val currentStore: () -> Store,
+    private val applyStore: (Store) -> Unit,
+    private val notify: (String) -> Unit,
+) {
+    var account by mutableStateOf(SyncAccount.load(app))
+        private set
+    var status by mutableStateOf<SyncStatus>(if (account.signedIn) SyncStatus.Synced else SyncStatus.SignedOut)
+        private set
+    var conflict by mutableStateOf<Conflict?>(null)
+        private set
+    var signingIn by mutableStateOf(false)
+        private set
+
+    private val mutex = Mutex()
+    private var uploadJob: Job? = null
+    private val client get() = Identity.getAuthorizationClient(app)
+    private val request get() = AuthorizationRequest.builder().setRequestedScopes(listOf(Scope(DRIVE_SCOPE))).build()
+
+    private fun persist(a: SyncAccount) {
+        account = a
+        a.save(app)
+    }
+
+    /** A token without UI; throws [NeedsSignIn] if the user must consent again. */
+    private suspend fun token(): String {
+        val result = client.authorize(request).await()
+        if (result.hasResolution()) throw NeedsSignIn
+        return result.accessToken ?: throw DriveException("Google returned no access token")
+    }
+
+    // ------------------------------------------------------------ sign-in
+
+    /** Start sign-in; [launch] shows Google's consent screen when needed. */
+    fun signIn(folder: String, launch: (IntentSenderRequest) -> Unit) {
+        persist(account.withFolder(folder.ifBlank { account.folder }))
+        signingIn = true
+        client.authorize(request)
+            .addOnSuccessListener { r ->
+                val pending = r.pendingIntent
+                if (r.hasResolution() && pending != null) launch(IntentSenderRequest.Builder(pending.intentSender).build())
+                else onAuthorized(r.accessToken)
+            }
+            .addOnFailureListener { e ->
+                signingIn = false
+                status = SyncStatus.Error(describe(e))
+            }
+    }
+
+    /** Result of Google's consent screen. */
+    fun onConsentResult(resultCode: Int, data: Intent?) {
+        if (resultCode != Activity.RESULT_OK) {
+            signingIn = false
+            return
+        }
+        try {
+            onAuthorized(client.getAuthorizationResultFromIntent(data).accessToken)
+        } catch (e: ApiException) {
+            signingIn = false
+            status = SyncStatus.Error(describe(e))
+        }
+    }
+
+    private fun onAuthorized(token: String?) {
+        if (token == null) {
+            signingIn = false
+            status = SyncStatus.Error("Google returned no access token")
+            return
+        }
+        scope.launch {
+            val email = withContext(Dispatchers.IO) { Drive.userEmail(token) }
+            persist(account.copy(signedIn = true, email = email, version = null, fileId = null))
+            signingIn = false
+            syncNow()
+        }
+    }
+
+    fun signOut() {
+        val email = account.email
+        scope.launch {
+            runCatching {
+                val token = client.authorize(request).await().accessToken
+                if (token != null) client.clearToken(ClearTokenRequest.builder().setToken(token).build()).await()
+                if (email != null) {
+                    client.revokeAccess(
+                        RevokeAccessRequest.builder()
+                            .setAccount(android.accounts.Account(email, "com.google"))
+                            .setScopes(listOf(Scope(DRIVE_SCOPE)))
+                            .build(),
+                    ).await()
+                }
+            }
+        }
+        persist(SyncAccount(folder = account.folder))
+        status = SyncStatus.SignedOut
+        notify("Signed out. Your data stays on this phone and in Drive.")
+    }
+
+    fun changeFolder(name: String) {
+        if (name.isBlank() || name.trim() == account.folder) return
+        persist(account.withFolder(name))
+        syncNow()
+    }
+
+    // ------------------------------------------------------------ syncing
+
+    private sealed interface Outcome {
+        data class UpToDate(val meta: DriveMeta) : Outcome
+        data class Pushed(val meta: DriveMeta) : Outcome
+        data class Pulled(val meta: DriveMeta, val remote: String) : Outcome
+        data class Clash(val meta: DriveMeta, val remote: String) : Outcome
+    }
+
+    /** Same data, ignoring formatting (desktop and Android format JSON differently). */
+    private fun sameData(remote: String, local: Store) = runCatching { Store.fromJson(remote) == local }.getOrDefault(false)
+
+    /** Bring local and Drive in step. */
+    fun syncNow() = run { token, acct, store ->
+        val data = store.toJson()
+        val meta = Drive.findFile(token, acct) ?: return@run Outcome.Pushed(Drive.upload(token, acct, data))
+        if (meta.version == acct.version) {
+            return@run if (acct.dirty) Outcome.Pushed(Drive.upload(token, acct, data)) else Outcome.UpToDate(meta)
+        }
+        val remote = Drive.download(token, meta.id)
+        val firstTime = acct.version == null
+        if ((acct.dirty || (firstTime && store.goals.isNotEmpty())) && !sameData(remote, store)) Outcome.Clash(meta, remote)
+        else Outcome.Pulled(meta, remote)
+    }
+
+    /** Called after every local save. */
+    fun localSaved() {
+        if (!account.signedIn) return
+        if (!account.dirty) persist(account.copy(dirty = true))
+        uploadJob?.cancel()
+        uploadJob = scope.launch {
+            delay(2_000)
+            upload(force = false)
+        }
+    }
+
+    /** Upload now (e.g. app going to the background) if anything is unsent. */
+    fun flush() {
+        if (account.signedIn && account.dirty) {
+            uploadJob?.cancel()
+            upload(force = false)
+        }
+    }
+
+    private fun upload(force: Boolean) = run { token, acct, store ->
+        if (!force && acct.version != null) {
+            val meta = Drive.findFile(token, acct)
+            if (meta != null && meta.version != acct.version) return@run Outcome.Clash(meta, Drive.download(token, meta.id))
+        }
+        Outcome.Pushed(Drive.upload(token, acct, store.toJson()))
+    }
+
+    private fun run(work: (String, SyncAccount, Store) -> Outcome) {
+        if (!account.signedIn) return
+        scope.launch {
+            mutex.withLock {
+                status = SyncStatus.Syncing
+                val acct = account
+                val store = currentStore()
+                try {
+                    val token = token()
+                    when (val o = withContext(Dispatchers.IO) { work(token, acct, store) }) {
+                        is Outcome.UpToDate -> markSynced(o.meta)
+                        is Outcome.Pushed -> markSynced(o.meta)
+                        is Outcome.Pulled -> {
+                            applyRemote(o.remote)
+                            markSynced(o.meta)
+                        }
+                        is Outcome.Clash -> {
+                            status = SyncStatus.Error("Choose which copy to keep")
+                            conflict = Conflict(o.meta, o.remote)
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (e === NeedsSignIn || (e is DriveException && e.isAuth)) {
+                        persist(SyncAccount(folder = acct.folder, dirty = acct.dirty))
+                        status = SyncStatus.SignedOut
+                        notify("Google Drive sign-in expired. Sign in again to keep syncing.")
+                    } else {
+                        status = SyncStatus.Error(describe(e))
+                    }
+                }
+            }
+        }
+    }
+
+    private fun markSynced(meta: DriveMeta) {
+        persist(account.copy(fileId = meta.id, version = meta.version, dirty = false, lastSync = System.currentTimeMillis()))
+        status = SyncStatus.Synced
+    }
+
+    /** Replace local data with Drive's copy, keeping a backup of the local file. */
+    private fun applyRemote(remote: String) {
+        val store = try {
+            Store.fromJson(remote)
+        } catch (e: Exception) {
+            status = SyncStatus.Error("Drive file isn't Planner data: ${e.message}")
+            return
+        }
+        File(app.filesDir, "data.before-drive.json").writeText(currentStore().toJson())
+        applyStore(store)
+    }
+
+    fun resolveConflict(useDrive: Boolean?) {
+        val c = conflict ?: return
+        conflict = null
+        when (useDrive) {
+            true -> {
+                applyRemote(c.remote)
+                markSynced(c.meta)
+            }
+            false -> {
+                File(app.filesDir, "data.drive-backup.json").writeText(c.remote)
+                persist(account.copy(version = c.meta.version))
+                upload(force = true)
+            }
+            null -> status = SyncStatus.Error("Not synced yet — choose which copy to keep")
+        }
+    }
+
+    private fun describe(e: Throwable): String = when (e) {
+        is ApiException -> when (e.statusCode) {
+            // DEVELOPER_ERROR: this package + signing key isn't registered as an Android client.
+            10 -> "This build isn't registered with Google yet (package name + SHA-1). See the README."
+            7 -> "No internet connection"
+            else -> "Google sign-in failed (${e.statusCode})"
+        }
+        else -> e.message ?: e.toString()
+    }
+}

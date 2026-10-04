@@ -1,23 +1,33 @@
 //! Google Drive storage. No GTK widgets here: everything is blocking and meant
 //! to run on a worker thread (see `sync.rs`).
 //!
-//! - Sign-in: none of our own. The Google account added in Ubuntu Settings →
-//!   Online Accounts (GNOME Online Accounts, "GOA") hands out access tokens
-//!   over D-Bus, so Planner needs no OAuth client id or secret.
-//! - Data: one JSON file, `My Drive/<folder>/planner-data.json`. The folder
-//!   (default "Planner") is chosen by the user. GOA's token can reach the whole
-//!   Drive, so staying inside that folder is enforced here: every lookup is
-//!   scoped to the folder, and Planner never lists or touches anything else.
-//! - Settings live in `~/.config/planner/google-drive.json` (no secrets in it).
+//! - Sign-in: OAuth 2.0 for installed apps, using a loopback redirect
+//!   (http://127.0.0.1:<random port>) and PKCE. The OAuth client (id/secret)
+//!   is built in from `google-client.json` at compile time (see build.rs), or
+//!   entered once in the sign-in window if the build has none.
+//! - Scope `drive.file`: Planner only sees files its own Google Cloud project
+//!   created. The Android app uses the same project, so both see one file.
+//! - Data: `My Drive/<folder>/planner-data.json` (folder defaults to "Planner").
+//! - The account (refresh token, file id, sync bookkeeping) lives in
+//!   `~/.config/planner/google-drive.json`, readable only by you.
 
-use gtk::{gio, glib};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    fs,
+    io::{self, Read, Write},
+    net::TcpListener,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-const GOA: &str = "org.gnome.OnlineAccounts";
-const GOA_ROOT: &str = "/org/gnome/OnlineAccounts";
-const GOA_ACCOUNT: &str = "org.gnome.OnlineAccounts.Account";
-const GOA_OAUTH2: &str = "org.gnome.OnlineAccounts.OAuth2Based";
+const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
+const SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 const API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 pub const DEFAULT_FOLDER: &str = "Planner";
@@ -26,11 +36,27 @@ const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// Which Google account and folder Planner syncs with, plus sync bookkeeping.
+/// OAuth client compiled into this build (from google-client.json), if any.
+fn builtin_client() -> Option<(&'static str, &'static str)> {
+    match (option_env!("PLANNER_GOOGLE_CLIENT_ID"), option_env!("PLANNER_GOOGLE_CLIENT_SECRET")) {
+        (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some((id, secret)),
+        _ => None,
+    }
+}
+
+pub fn has_builtin_client() -> bool {
+    builtin_client().is_some()
+}
+
+/// Google account, folder and sync bookkeeping, persisted between runs.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Account {
-    /// GNOME Online Accounts id of the Google account (None = not connected).
-    pub goa_id: Option<String>,
+    /// Only used when the build has no built-in client.
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    pub refresh_token: Option<String>,
     pub email: Option<String>,
     #[serde(default = "default_folder")]
     pub folder: String,
@@ -51,7 +77,9 @@ fn default_folder() -> String {
 impl Default for Account {
     fn default() -> Self {
         Account {
-            goa_id: None,
+            client_id: String::new(),
+            client_secret: String::new(),
+            refresh_token: None,
             email: None,
             folder: default_folder(),
             file_id: None,
@@ -77,21 +105,40 @@ impl Account {
             .unwrap_or_default()
     }
 
+    /// Written with mode 0600: it holds the refresh token.
     pub fn save(&self) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
         let path = Self::path();
         fs::create_dir_all(path.parent().unwrap())?;
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self).expect("account serializes"))?;
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(serde_json::to_string_pretty(self).expect("account serializes").as_bytes())?;
         fs::rename(tmp, path)
     }
 
     pub fn signed_in(&self) -> bool {
-        self.goa_id.is_some()
+        self.refresh_token.is_some()
     }
 
-    /// Disconnect, remembering the folder name for next time.
+    /// The OAuth client to use: built-in, else the one entered by the user.
+    fn client(&self) -> Result<(String, String)> {
+        if let Some((id, secret)) = builtin_client() {
+            return Ok((id.into(), secret.into()));
+        }
+        if self.client_id.trim().is_empty() || self.client_secret.trim().is_empty() {
+            return Err("No Google OAuth client configured".into());
+        }
+        Ok((self.client_id.trim().into(), self.client_secret.trim().into()))
+    }
+
+    /// Sign out, keeping the folder choice and any entered client.
     pub fn sign_out(&mut self) {
-        *self = Account { folder: self.folder.clone(), ..Default::default() };
+        *self = Account {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            folder: self.folder.clone(),
+            ..Default::default()
+        };
     }
 
     /// Point at another folder: the file there (if any) is found on next sync.
@@ -100,108 +147,6 @@ impl Account {
         self.file_id = None;
         self.version = None;
     }
-}
-
-// ---------------------------------------------------------------- GNOME Online Accounts
-
-/// A Google account from Settings → Online Accounts.
-#[derive(Clone, Debug)]
-pub struct GoaAccount {
-    pub id: String,
-    path: String,
-    pub email: String,
-    /// GNOME needs you to sign in again (e.g. the password changed or access expired).
-    pub attention_needed: bool,
-}
-
-fn session_bus() -> Result<gio::DBusConnection> {
-    gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).map_err(|e| e.to_string())
-}
-
-/// Google accounts set up in Ubuntu Settings (empty if Online Accounts isn't running).
-pub fn google_accounts() -> Vec<GoaAccount> {
-    let Ok(bus) = session_bus() else { return Vec::new() };
-    let Ok(reply) = bus.call_sync(
-        Some(GOA),
-        GOA_ROOT,
-        "org.freedesktop.DBus.ObjectManager",
-        "GetManagedObjects",
-        None,
-        glib::VariantTy::new("(a{oa{sa{sv}}})").ok(),
-        gio::DBusCallFlags::NONE,
-        5000,
-        gio::Cancellable::NONE,
-    ) else {
-        return Vec::new();
-    };
-    let objects = reply.child_value(0);
-    let mut out = Vec::new();
-    for i in 0..objects.n_children() {
-        let entry = objects.child_value(i);
-        let path = entry.child_value(0).str().unwrap_or_default().to_string();
-        let ifaces = entry.child_value(1);
-        let Some(props) = dict_get(&ifaces, GOA_ACCOUNT) else { continue };
-        if dict_get(&ifaces, GOA_OAUTH2).is_none() {
-            continue;
-        }
-        let text = |k: &str| dict_get(&props, k).and_then(|v| v.str().map(String::from)).unwrap_or_default();
-        if text("ProviderType") != "google" {
-            continue;
-        }
-        out.push(GoaAccount {
-            id: text("Id"),
-            path,
-            email: text("Identity"),
-            attention_needed: dict_get(&props, "AttentionNeeded").and_then(|v| v.get::<bool>()).unwrap_or(false),
-        });
-    }
-    out
-}
-
-/// Value for `key` in a D-Bus dictionary (`a{s…}`), unboxing `v` values.
-fn dict_get(dict: &glib::Variant, key: &str) -> Option<glib::Variant> {
-    (0..dict.n_children()).map(|i| dict.child_value(i)).find(|e| e.child_value(0).str() == Some(key)).map(|e| {
-        let v = e.child_value(1);
-        if v.is_type(glib::VariantTy::VARIANT) { v.as_variant().unwrap_or(v) } else { v }
-    })
-}
-
-pub const NEEDS_SIGN_IN: &str = "Your Google account needs you to sign in again in Settings → Online Accounts";
-
-fn access_token(acct: &Account) -> Result<String> {
-    let id = acct.goa_id.as_deref().ok_or("Not connected")?;
-    let goa = google_accounts()
-        .into_iter()
-        .find(|a| a.id == id)
-        .ok_or("The Google account was removed from Settings → Online Accounts")?;
-    let reply = session_bus()?
-        .call_sync(
-            Some(GOA),
-            &goa.path,
-            GOA_OAUTH2,
-            "GetAccessToken",
-            None,
-            glib::VariantTy::new("(si)").ok(),
-            gio::DBusCallFlags::NONE,
-            20000,
-            gio::Cancellable::NONE,
-        )
-        .map_err(|e| if e.message().contains("NotAuthorized") { NEEDS_SIGN_IN.to_string() } else { e.to_string() })?;
-    reply.child_value(0).str().map(String::from).ok_or_else(|| "No access token".into())
-}
-
-/// The account was removed from Settings: sync can't continue until reconnected.
-pub fn is_account_gone(err: &str) -> bool {
-    err.contains("removed from Settings")
-}
-
-pub fn needs_sign_in(err: &str) -> bool {
-    err == NEEDS_SIGN_IN
-}
-
-/// Open Settings → Online Accounts.
-pub fn open_online_accounts() {
-    let _ = std::process::Command::new("gnome-control-center").arg("online-accounts").spawn();
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -225,18 +170,171 @@ fn body(resp: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>
     if status.is_success() {
         return Ok(text);
     }
+    // Google errors: {"error": "invalid_grant", ...} or {"error": {"message": ...}}
     let detail = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|v| v["error"]["message"].as_str().or(v["error"].as_str()).map(String::from))
         .unwrap_or(text);
-    if status.as_u16() == 403 && detail.to_lowercase().contains("scope") {
-        return Err("This Google account doesn't give apps Drive access. In Settings → Online Accounts → Google, turn on Files.".into());
-    }
     Err(format!("Google returned {}: {detail}", status.as_u16()))
 }
 
 fn json<T: for<'de> Deserialize<'de>>(text: &str) -> Result<T> {
     serde_json::from_str(text).map_err(|e| format!("Unexpected reply from Google: {e}"))
+}
+
+/// The sign-in was revoked or expired: the user has to sign in again.
+pub fn is_auth_error(err: &str) -> bool {
+    err.contains("invalid_grant") || err.contains("returned 401")
+}
+
+// ---------------------------------------------------------------- OAuth
+
+#[derive(Deserialize)]
+struct TokenReply {
+    access_token: String,
+    expires_in: u64,
+    refresh_token: Option<String>,
+}
+
+/// Access tokens last an hour; keep the current one in memory only.
+fn token_cache() -> &'static Mutex<Option<(String, String, Instant)>> {
+    static CACHE: OnceLock<Mutex<Option<(String, String, Instant)>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn access_token(acct: &Account) -> Result<String> {
+    let refresh = acct.refresh_token.as_deref().ok_or("Not signed in")?;
+    if let Some((key, token, until)) = &*token_cache().lock().unwrap()
+        && key == refresh
+        && Instant::now() < *until
+    {
+        return Ok(token.clone());
+    }
+    let (id, secret) = acct.client()?;
+    let reply: TokenReply = json(&body(agent().post(TOKEN_URL).send_form([
+        ("client_id", id.as_str()),
+        ("client_secret", secret.as_str()),
+        ("refresh_token", refresh),
+        ("grant_type", "refresh_token"),
+    ]))?)?;
+    let until = Instant::now() + Duration::from_secs(reply.expires_in.saturating_sub(60));
+    *token_cache().lock().unwrap() = Some((refresh.to_string(), reply.access_token.clone(), until));
+    Ok(reply.access_token)
+}
+
+/// A started sign-in: open `url` in the browser, then call `finish`.
+pub struct PendingAuth {
+    pub url: String,
+    listener: TcpListener,
+    redirect: String,
+    verifier: String,
+    state: String,
+}
+
+pub fn begin_auth(acct: &Account) -> Result<PendingAuth> {
+    let (id, _) = acct.client()?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Couldn't open a local port: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let redirect = format!("http://127.0.0.1:{port}");
+    let verifier = random_token(48);
+    let state = random_token(16);
+    let url = format!(
+        "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}\
+         &code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
+        encode(&id),
+        encode(&redirect),
+        encode(SCOPE),
+        pkce_challenge(&verifier),
+        state,
+    );
+    Ok(PendingAuth { url, listener, redirect, verifier, state })
+}
+
+impl PendingAuth {
+    /// Wait (up to 5 minutes, or until `cancel`) for Google to redirect back,
+    /// then trade the code for tokens. Returns the account, signed in.
+    pub fn finish(self, mut acct: Account, cancel: Arc<AtomicBool>) -> Result<Account> {
+        self.listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut stream = loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Sign-in cancelled".into());
+            }
+            if Instant::now() > deadline {
+                return Err("Sign-in timed out".into());
+            }
+            match self.listener.accept() {
+                Ok((s, _)) => break s,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(150)),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        stream.set_nonblocking(false).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let query = request
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|p| p.split_once('?'))
+            .map(|(_, q)| q)
+            .unwrap_or("");
+        let param = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{k}="))).map(decode);
+
+        let outcome = match (param("code"), param("state"), param("error")) {
+            (_, _, Some(err)) => Err(format!("Google sign-in was not completed ({err})")),
+            (Some(code), Some(state), None) if state == self.state => Ok(code),
+            _ => Err("Unexpected reply from the browser".to_string()),
+        };
+        let page = match &outcome {
+            Ok(_) => "Planner is connected to Google Drive. You can close this tab.",
+            Err(_) => "Sign-in didn't complete. You can close this tab and try again from Planner.",
+        };
+        let html = format!(
+            "<!doctype html><meta charset=utf-8><title>Planner</title>\
+             <body style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\"><p>{page}</p>"
+        );
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        );
+        let code = outcome?;
+
+        let (id, secret) = acct.client()?;
+        let reply: TokenReply = json(&body(agent().post(TOKEN_URL).send_form([
+            ("code", code.as_str()),
+            ("client_id", id.as_str()),
+            ("client_secret", secret.as_str()),
+            ("redirect_uri", self.redirect.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code_verifier", self.verifier.as_str()),
+        ]))?)?;
+        let refresh = reply.refresh_token.ok_or("Google didn't return a refresh token; try signing in again")?;
+        *token_cache().lock().unwrap() = Some((
+            refresh.clone(),
+            reply.access_token,
+            Instant::now() + Duration::from_secs(reply.expires_in.saturating_sub(60)),
+        ));
+        acct.refresh_token = Some(refresh);
+        acct.email = user_email(&acct).ok();
+        Ok(acct)
+    }
+}
+
+/// Best effort: tell Google to drop the token.
+pub fn revoke(acct: &Account) {
+    if let Some(t) = &acct.refresh_token {
+        let _ = agent().post(REVOKE_URL).send_form([("token", t.as_str())]);
+    }
+    *token_cache().lock().unwrap() = None;
+}
+
+fn user_email(acct: &Account) -> Result<String> {
+    let v: serde_json::Value = json(&get(acct, &format!("{API}/about?fields=user(emailAddress)"))?)?;
+    v["user"]["emailAddress"].as_str().map(String::from).ok_or_else(|| "No email in reply".into())
 }
 
 fn get(acct: &Account, url: &str) -> Result<String> {
@@ -336,6 +434,24 @@ fn create(acct: &Account, metadata: serde_json::Value) -> Result<String> {
     v["id"].as_str().map(String::from).ok_or_else(|| "Drive didn't return a file id".into())
 }
 
+// ---------------------------------------------------------------- helpers
+
+fn random_token(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).expect("random bytes");
+    base64url(&buf)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    let mut sum = gtk::glib::Checksum::new(gtk::glib::ChecksumType::Sha256).expect("sha256");
+    sum.update(verifier.as_bytes());
+    base64url(&sum.digest())
+}
+
+fn base64url(data: &[u8]) -> String {
+    gtk::glib::base64_encode(data).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
+}
+
 /// Percent-encode for a URL query value.
 fn encode(s: &str) -> String {
     s.bytes()
@@ -346,23 +462,94 @@ fn encode(s: &str) -> String {
         .collect()
 }
 
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(v) = hex {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn query_values_are_escaped() {
-        assert_eq!(quoted("My 'Plans'"), r"'My \'Plans\''");
-        assert_eq!(encode("name = 'a b'"), "name%20%3D%20%27a%20b%27");
+    fn with_client() -> Account {
+        Account { client_id: "id".into(), client_secret: "secret".into(), ..Default::default() }
     }
 
     #[test]
-    fn old_settings_files_still_load() {
-        // The previous version stored an OAuth client; those fields are ignored.
-        let old = r#"{"client_id":"x","client_secret":"y","refresh_token":null,"email":null,"dirty":false}"#;
+    fn url_encoding_round_trips() {
+        let s = "4/0Ab_x+y z/é?&=";
+        assert_eq!(decode(&encode(s)), s);
+        assert_eq!(encode("http://127.0.0.1:8080"), "http%3A%2F%2F127.0.0.1%3A8080");
+        assert_eq!(decode("a%2"), "a%2");
+    }
+
+    #[test]
+    fn pkce_challenge_is_base64url_sha256() {
+        // Expected value computed independently:
+        // base64.urlsafe_b64encode(hashlib.sha256(verifier).digest()).rstrip("=")
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWnOEjXk"),
+            "JeGxM-AFIzw6jttzaxRHhAH-ZgSJs3LN_xzZXDwgwho"
+        );
+        assert!(!random_token(32).contains(['+', '/', '=']));
+    }
+
+    /// The browser redirect is read off the loopback port; a reply whose
+    /// `state` doesn't match is rejected before anything is sent to Google.
+    #[test]
+    fn loopback_rejects_wrong_state_and_answers_browser() {
+        let acct = with_client();
+        let pending = begin_auth(&acct).unwrap();
+        assert!(pending.url.contains("code_challenge_method=S256"));
+        assert!(pending.url.contains("scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.file"));
+        let redirect = pending.redirect.clone();
+        let browser = std::thread::spawn(move || {
+            let addr = redirect.trim_start_matches("http://");
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            write!(s, "GET /?state=forged&code=abc HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            s.read_to_string(&mut reply).unwrap();
+            reply
+        });
+        let err = pending.finish(acct, Arc::new(AtomicBool::new(false))).unwrap_err();
+        assert_eq!(err, "Unexpected reply from the browser");
+        let reply = browser.join().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK") && reply.contains("didn't complete"));
+    }
+
+    #[test]
+    fn sign_in_can_be_cancelled() {
+        let acct = with_client();
+        let pending = begin_auth(&acct).unwrap();
+        assert_eq!(pending.finish(acct, Arc::new(AtomicBool::new(true))).unwrap_err(), "Sign-in cancelled");
+    }
+
+    #[test]
+    fn query_values_are_escaped() {
+        assert_eq!(quoted("My 'Plans'"), r"'My \'Plans\''");
+    }
+
+    #[test]
+    fn older_settings_files_still_load() {
+        // The Online Accounts version stored a GOA id; it's ignored now.
+        let old = r#"{"goa_id":"account_1","email":"a@b.c","folder":"Plans","dirty":true}"#;
         let acct: Account = serde_json::from_str(old).unwrap();
         assert!(!acct.signed_in());
-        assert_eq!(acct.folder, "Planner");
+        assert_eq!(acct.folder, "Plans");
     }
 
     #[test]
@@ -370,13 +557,5 @@ mod tests {
         let mut acct = Account { file_id: Some("f".into()), version: Some("3".into()), ..Default::default() };
         acct.set_folder("  Plans 2026 ");
         assert_eq!((acct.folder.as_str(), acct.file_id, acct.version), ("Plans 2026", None, None));
-    }
-
-    /// Reads (never writes) the real Online Accounts service when available.
-    #[test]
-    fn lists_google_accounts_without_panicking() {
-        for a in google_accounts() {
-            assert!(!a.id.is_empty());
-        }
     }
 }

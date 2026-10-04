@@ -56,6 +56,19 @@ class PlannerViewModel(app: Application) : AndroidViewModel(app) {
 
     private var saveJob: Job? = null
 
+    /** Google Drive sync; applying Drive's copy saves locally without marking it dirty. */
+    val drive = DriveSync(
+        app = app,
+        scope = viewModelScope,
+        currentStore = { store },
+        applyStore = { s ->
+            store = s
+            saveJob?.cancel()
+            viewModelScope.launch(Dispatchers.IO) { repo.save(s) }
+        },
+        notify = { toastUndo(it) },
+    )
+
     fun update(f: (Store) -> Store) {
         store = f(store)
         scheduleSave()
@@ -85,14 +98,18 @@ class PlannerViewModel(app: Application) : AndroidViewModel(app) {
         saveJob = viewModelScope.launch {
             delay(400)
             withContext(Dispatchers.IO) { repo.save(snapshot) }
+            drive.localSaved()
         }
     }
 
     /** Write now (app going to background). */
     fun flush() {
+        val pending = saveJob?.isActive == true // read before cancelling
         saveJob?.cancel()
         val snapshot = store
         viewModelScope.launch(NonCancellable + Dispatchers.IO) { repo.save(snapshot) }
+        if (pending) drive.localSaved()
+        drive.flush()
     }
 
     /** Follow the calendar past midnight; keeps "today" in step on resume. */

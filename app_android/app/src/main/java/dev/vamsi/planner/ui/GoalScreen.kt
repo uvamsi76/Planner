@@ -136,6 +136,8 @@ fun GoalScreen(vm: PlannerViewModel, gid: Long, snackbar: SnackbarHostState, onM
                     else IconButton(onClick = { vm.screen = Screen.Today }) { Ic(R.drawable.ic_prev, "Back") }
                 },
                 actions = {
+                    // Google Drive: database icon with ✕ (signed out) or ✓ (synced).
+                    DriveButton(vm)
                     IconToggleButton(checked = vm.hidePast, onCheckedChange = { vm.hidePast = it }) { Ic(R.drawable.ic_hide, "Hide past rows") }
                     Box {
                         IconButton(onClick = { menu = true }) { Ic(R.drawable.ic_more, "More") }

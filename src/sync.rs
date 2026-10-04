@@ -22,6 +22,7 @@ use std::{
     cell::{Cell, RefCell},
     f64::consts::PI,
     rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -41,6 +42,8 @@ pub struct State {
     again: Cell<bool>,
     upload_pending: Cell<bool>,
     closing: Cell<bool>,
+    /// Set while the browser sign-in is in progress; storing true cancels it.
+    signing_in: RefCell<Option<Arc<AtomicBool>>>,
     /// Rebuilds the open Google Drive window, if any.
     dialog: RefCell<Option<Rc<dyn Fn()>>>,
 }
@@ -57,6 +60,7 @@ impl State {
             again: Cell::new(false),
             upload_pending: Cell::new(false),
             closing: Cell::new(false),
+            signing_in: RefCell::new(None),
             dialog: RefCell::new(None),
         }
     }
@@ -91,7 +95,7 @@ fn refresh_dialog(ui: &Ui) {
 
 fn tooltip(ui: &Ui, s: &Status) -> String {
     match s {
-        Status::SignedOut => "Not syncing — connect Google Drive".into(),
+        Status::SignedOut => "Not syncing — sign in to Google Drive".into(),
         Status::Syncing => "Syncing with Google Drive…".into(),
         Status::Synced => match &ui.sync.account.borrow().email {
             Some(e) => format!("Saved to Google Drive ({e})"),
@@ -272,7 +276,7 @@ pub fn sync_now(ui: &Rc<Ui>) {
             }
             let remote = cloud::download(&acct, &meta.id)?;
             let first_time = acct.version.is_none();
-            if (acct.dirty || (first_time && local_has_data)) && remote != data {
+            if (acct.dirty || (first_time && local_has_data)) && !same_data(&remote, &data) {
                 Ok(Outcome::Conflict(meta, remote))
             } else {
                 Ok(Outcome::Pulled(meta, remote))
@@ -316,6 +320,15 @@ fn upload(ui: &Rc<Ui>, force: bool) {
     });
 }
 
+/// Same data, ignoring formatting: the Android app writes the same JSON
+/// structure but formats it differently.
+fn same_data(a: &str, b: &str) -> bool {
+    match (serde_json::from_str::<serde_json::Value>(a), serde_json::from_str::<serde_json::Value>(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 fn handle(ui: &Rc<Ui>, result: cloud::Result<Outcome>) {
     ui.sync.busy.set(false);
     match result {
@@ -338,13 +351,13 @@ fn handle(ui: &Rc<Ui>, result: cloud::Result<Outcome>) {
             return;
         }
         Err(e) => {
-            if cloud::is_account_gone(&e) {
+            if cloud::is_auth_error(&e) {
                 ui.sync.account.borrow_mut().sign_out();
                 save_account(ui);
                 set_status(ui, Status::SignedOut);
-                ui.toast("The Google account was removed from Settings, so syncing stopped.");
+                ui.toast("Google Drive sign-in expired. Sign in again to keep syncing.");
             } else {
-                // Includes "sign in again in Settings": stay connected and retry later.
+                // Network trouble etc.: stay signed in; the next save or "Sync now" retries.
                 set_status(ui, Status::Error(e));
             }
             if ui.sync.closing.get() {
@@ -475,34 +488,28 @@ fn dialog_content(ui: &Rc<Ui>) -> gtk::Widget {
         l.set_justify(gtk::Justification::Center);
         l
     };
+    let folder_row = adw::EntryRow::builder().title("Folder in My Drive").text(&acct.folder).build();
 
     if acct.signed_in() {
         let who = acct.email.clone().unwrap_or_else(|| "your Google account".into());
-        page.append(&centered(&format!("Connected as {who}"), &["title-4"]));
+        page.append(&centered(&format!("Signed in as {who}"), &["title-4"]));
         page.append(&centered(
             &format!("Your goals, plans and day schedules are saved to My Drive › {} › {}.", acct.folder, cloud::FILE_NAME),
             &["dim-label"],
         ));
-        let error = match status(ui) {
-            Status::Error(e) => Some(e),
-            _ => None,
-        };
-        let state = match (&error, status(ui)) {
-            (Some(e), _) => e.clone(),
-            (None, Status::Syncing) => "Syncing…".to_string(),
+        let state = match status(ui) {
+            Status::Error(e) => e,
+            Status::Syncing => "Syncing…".to_string(),
             _ => match acct.last_sync.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()) {
                 Some(t) => format!("Last synced {}", t.format("%a %-d %b, %H:%M")),
                 None => "Synced".into(),
             },
         };
-        page.append(&centered(&state, &["caption", if error.is_some() { "warning" } else { "dim-label" }]));
-        if error.as_deref().is_some_and(cloud::needs_sign_in) {
-            page.append(&online_accounts_button());
-        }
+        let is_error = matches!(status(ui), Status::Error(_));
+        page.append(&centered(&state, &["caption", if is_error { "warning" } else { "dim-label" }]));
 
         // Change the folder (the data file there is picked up, or created).
-        let group = adw::PreferencesGroup::new();
-        let folder_row = adw::EntryRow::builder().title("Folder in My Drive").text(&acct.folder).show_apply_button(true).build();
+        folder_row.set_show_apply_button(true);
         folder_row.connect_apply({
             let ui = ui.clone();
             move |row| {
@@ -515,6 +522,7 @@ fn dialog_content(ui: &Rc<Ui>) -> gtk::Widget {
                 sync_now(&ui);
             }
         });
+        let group = adw::PreferencesGroup::new();
         group.add(&folder_row);
         page.append(&group);
 
@@ -524,14 +532,16 @@ fn dialog_content(ui: &Rc<Ui>) -> gtk::Widget {
             let ui = ui.clone();
             move |_| sync_now(&ui)
         });
-        let out = gtk::Button::builder().label("Disconnect").css_classes(["pill", "destructive-action"]).build();
+        let out = gtk::Button::builder().label("Sign out").css_classes(["pill", "destructive-action"]).build();
         out.connect_clicked({
             let ui = ui.clone();
             move |_| {
+                let acct = ui.sync.account.borrow().clone();
+                gio::spawn_blocking(move || cloud::revoke(&acct));
                 ui.sync.account.borrow_mut().sign_out();
                 save_account(&ui);
                 set_status(&ui, Status::SignedOut);
-                ui.toast("Disconnected. Your data stays on this computer and in Drive.");
+                ui.toast("Signed out. Your data stays on this computer and in Drive.");
             }
         });
         buttons.append(&sync);
@@ -542,87 +552,120 @@ fn dialog_content(ui: &Rc<Ui>) -> gtk::Widget {
 
     page.append(&centered("Store your plans in Google Drive", &["title-4"]));
     page.append(&centered(
-        "Planner uses the Google account from Ubuntu Settings, so there's nothing extra to set up. \
-         Your data is kept in one folder in My Drive and still saved on this computer for offline use.",
+        &format!(
+            "Sign in and Planner keeps your data in My Drive › {} › {}, shared with the Planner \
+             Android app on the same account. A local copy stays for offline use.",
+            acct.folder,
+            cloud::FILE_NAME
+        ),
         &["dim-label"],
     ));
 
-    let accounts = cloud::google_accounts();
-    if accounts.is_empty() {
-        page.append(&centered("No Google account in Settings → Online Accounts yet.", &["caption", "warning"]));
-        page.append(&online_accounts_button());
-        page.append(&refresh_button(ui));
-        return page.upcast();
-    }
-
     let group = adw::PreferencesGroup::new();
-    let emails: Vec<&str> = accounts.iter().map(|a| a.email.as_str()).collect();
-    let account_row = adw::ComboRow::builder().title("Google account").model(&gtk::StringList::new(&emails)).build();
-    let folder_row = adw::EntryRow::builder().title("Folder in My Drive").text(&acct.folder).build();
-    group.add(&account_row);
+    // Builds without a built-in OAuth client ask for one (see README).
+    let client_rows = (!cloud::has_builtin_client()).then(|| {
+        let id = adw::EntryRow::builder().title("OAuth client ID").text(&acct.client_id).build();
+        let secret = adw::PasswordEntryRow::builder().title("OAuth client secret").text(&acct.client_secret).build();
+        group.add(&id);
+        group.add(&secret);
+        (id, secret)
+    });
     group.add(&folder_row);
     page.append(&group);
     page.append(&centered(
-        "Planner only reads and writes planner-data.json in this folder. It's created if it doesn't exist.",
+        "Planner can only see files it creates, and keeps its data in this one folder.",
         &["dim-label", "caption"],
     ));
 
-    let attention = centered(cloud::NEEDS_SIGN_IN, &["caption", "warning"]);
-    let fix = online_accounts_button();
-    let connect = gtk::Button::builder().label("Use this account").css_classes(["pill", "suggested-action"]).halign(gtk::Align::Center).build();
+    let waiting = ui.sync.signing_in.borrow().is_some();
+    let sign_in = gtk::Button::builder()
+        .label(if waiting { "Waiting for the browser…" } else { "Sign in with Google" })
+        .css_classes(["pill", "suggested-action"])
+        .halign(gtk::Align::Center)
+        .build();
     let update = {
-        let (accounts, account_row, folder_row) = (accounts.clone(), account_row.clone(), folder_row.clone());
-        let (attention, fix, connect) = (attention.clone(), fix.clone(), connect.clone());
+        let (sign_in, client_rows, folder_row) = (sign_in.clone(), client_rows.clone(), folder_row.clone());
         move || {
-            let needs = accounts.get(account_row.selected() as usize).is_some_and(|a| a.attention_needed);
-            attention.set_visible(needs);
-            fix.set_visible(needs);
-            connect.set_sensitive(!needs && !folder_row.text().trim().is_empty());
+            let client_ok = client_rows.as_ref().is_none_or(|(id, secret)| !id.text().trim().is_empty() && !secret.text().trim().is_empty());
+            sign_in.set_sensitive(!waiting && client_ok && !folder_row.text().trim().is_empty());
         }
     };
     update();
-    account_row.connect_selected_notify({
-        let update = update.clone();
-        move |_| update()
-    });
+    if let Some((id, secret)) = &client_rows {
+        for row in [id.upcast_ref::<gtk::Editable>(), secret.upcast_ref::<gtk::Editable>()] {
+            let update = update.clone();
+            row.connect_changed(move |_| update());
+        }
+    }
     folder_row.connect_changed(move |_| update());
-    connect.connect_clicked({
+    sign_in.connect_clicked({
         let ui = ui.clone();
         move |_| {
-            let Some(chosen) = accounts.get(account_row.selected() as usize) else { return };
             {
                 let mut acct = ui.sync.account.borrow_mut();
-                acct.sign_out();
-                acct.goa_id = Some(chosen.id.clone());
-                acct.email = Some(chosen.email.clone());
+                if let Some((id, secret)) = &client_rows {
+                    acct.client_id = id.text().trim().to_string();
+                    acct.client_secret = secret.text().trim().to_string();
+                }
                 acct.set_folder(&folder_row.text());
             }
             save_account(&ui);
-            sync_now(&ui);
+            sign_in_flow(&ui);
         }
     });
-    page.append(&attention);
-    page.append(&fix);
-    page.append(&connect);
-    if let Status::Error(e) = status(ui) {
+    page.append(&sign_in);
+
+    if waiting {
+        let row = gtk::Box::builder().spacing(8).halign(gtk::Align::Center).build();
+        row.append(&gtk::Spinner::builder().spinning(true).build());
+        row.append(&label("Finish signing in in your browser.", &["dim-label"]));
+        let cancel = gtk::Button::builder().label("Cancel").css_classes(["flat"]).build();
+        cancel.connect_clicked({
+            let ui = ui.clone();
+            move |_| {
+                if let Some(flag) = ui.sync.signing_in.borrow().as_ref() {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        row.append(&cancel);
+        page.append(&row);
+    } else if let Status::Error(e) = status(ui) {
         page.append(&centered(&e, &["caption", "warning"]));
     }
-    page.append(&refresh_button(ui));
     page.upcast()
 }
 
-fn online_accounts_button() -> gtk::Button {
-    let b = gtk::Button::builder().label("Open Online Accounts…").css_classes(["pill"]).halign(gtk::Align::Center).build();
-    b.connect_clicked(|_| cloud::open_online_accounts());
-    b
-}
+/// Open Google's consent page in the browser and wait (on a worker thread)
+/// for it to redirect back to Planner.
+fn sign_in_flow(ui: &Rc<Ui>) {
+    let acct = ui.sync.account.borrow().clone();
+    let pending = match cloud::begin_auth(&acct) {
+        Ok(p) => p,
+        Err(e) => {
+            set_status(ui, Status::Error(e));
+            return;
+        }
+    };
+    gtk::UriLauncher::new(&pending.url).launch(Some(&ui.window), gio::Cancellable::NONE, |_| {});
+    let cancel = Arc::new(AtomicBool::new(false));
+    ui.sync.signing_in.replace(Some(cancel.clone()));
+    refresh_dialog(ui);
 
-/// Re-read Settings after adding or fixing an account there.
-fn refresh_button(ui: &Rc<Ui>) -> gtk::Button {
-    let b = gtk::Button::builder().label("Refresh").css_classes(["flat"]).halign(gtk::Align::Center).build();
-    b.connect_clicked({
-        let ui = ui.clone();
-        move |_| refresh_dialog(&ui)
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || pending.finish(acct, cancel))
+            .await
+            .unwrap_or_else(|_| Err("Sign-in crashed".into()));
+        ui.sync.signing_in.replace(None);
+        match result {
+            Ok(acct) => {
+                ui.sync.account.replace(acct);
+                save_account(&ui);
+                ui.window.present();
+                sync_now(&ui);
+            }
+            Err(e) => set_status(&ui, if e.contains("cancelled") { Status::SignedOut } else { Status::Error(e) }),
+        }
     });
-    b
 }

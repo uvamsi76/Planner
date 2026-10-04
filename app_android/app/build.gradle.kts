@@ -68,6 +68,7 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.play.services.auth)
     debugImplementation(libs.compose.ui.tooling)
     testImplementation(libs.junit)
 }
